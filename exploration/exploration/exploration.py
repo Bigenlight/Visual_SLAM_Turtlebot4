@@ -10,8 +10,6 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs
 from geometry_msgs.msg import TransformStamped
 
-
-
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -23,21 +21,12 @@ class FrontierExplorer(Node):
         self.current_goal = None
         self.exploring = False
 
-        
-        # Declare parameters
-        self.declare_parameter('max_goal_distance', 2.0)  # meters
-        
-        # Get parameter value
-        self.max_goal_distance = self.get_parameter('max_goal_distance').get_parameter_value().double_value
-
         # Set up TF listener to get robot's current pose
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Wait for the action server to be ready
         self.navigator.wait_for_server()
-        
-        
 
     def map_callback(self, msg):
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -91,37 +80,26 @@ class FrontierExplorer(Node):
                     break  # No need to check other neighbors
 
         return frontiers
-    
+
     def select_frontier(self, frontiers):
-        # Select the closest feasible frontier to the robot's current position
+        # Select the closest frontier to the robot's current position
 
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
             return frontiers[0]
 
-        # Compute distances and filter based on max_goal_distance
-        feasible_frontiers = []
+        # Compute distances
         distances = []
         for frontier in frontiers:
             dx = frontier.x - robot_position.x
             dy = frontier.y - robot_position.y
             distance = np.hypot(dx, dy)
-            if distance <= self.max_goal_distance:
-                feasible_frontiers.append(frontier)
-                distances.append(distance)
-
-        if not feasible_frontiers:
-            self.get_logger().info(f'No frontiers within {self.max_goal_distance} meters. Exploring further.')
-            # Optionally, increase max_goal_distance or handle accordingly
-            return frontiers  # Return all frontiers if none within threshold
+            distances.append(distance)
 
         # Select the frontier with the minimum distance
         min_index = np.argmin(distances)
-        selected_frontier = feasible_frontiers[min_index]
-        self.get_logger().info(f'Selected frontier at ({selected_frontier.x:.2f}, {selected_frontier.y:.2f}) with distance {distances[min_index]:.2f} meters')
-        return selected_frontier
-
+        return frontiers[min_index]
 
     def get_neighbors(self, x, y):
         # Get valid neighboring cells (4-connected grid)
