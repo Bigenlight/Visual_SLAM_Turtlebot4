@@ -30,14 +30,22 @@ class BoustrophedonExplorer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Wait for the action server to be ready
+        self.get_logger().info('Waiting for navigate_to_pose action server...')
         self.navigator.wait_for_server()
+        self.get_logger().info('Action server available.')
 
         # Create a service client for path planning
         self.get_plan_client = self.create_client(GetPlan, 'planner_server/get_plan')
+        while not self.get_plan_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for GetPlan service...')
+        self.get_logger().info('GetPlan service available.')
 
         # Parameters
-        self.declare_parameter('safe_distance', 0.2)  # meters
+        self.declare_parameter('safe_distance', 0.3)  # meters
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
+
+        self.declare_parameter('recovery_behavior_enabled', True)
+        self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
     def map_callback(self, msg):
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -57,6 +65,8 @@ class BoustrophedonExplorer(Node):
             self.exploring = False
             rclpy.shutdown()
             return
+
+        self.get_logger().info(f'Number of regions to explore: {num_features}')
 
         # Generate coverage path for each region
         for region_label in range(1, num_features + 1):
@@ -109,8 +119,9 @@ class BoustrophedonExplorer(Node):
                         waypoint = Point(x=mx, y=my, z=0.0)
                         waypoints.append(waypoint)
                     else:
-                        continue
+                        self.get_logger().debug(f'Waypoint at ({mx:.2f}, {my:.2f}) is too close to an obstacle.')
 
+        self.get_logger().info(f'Generated {len(waypoints)} waypoints for the region.')
         return waypoints
 
     def is_safe_point(self, x, y):
@@ -129,25 +140,64 @@ class BoustrophedonExplorer(Node):
     def follow_waypoints(self, waypoints):
         for idx, waypoint in enumerate(waypoints):
             next_waypoint = waypoints[idx + 1] if idx + 1 < len(waypoints) else None
-            goal_msg = NavigateToPose.Goal()
-            goal_msg.pose = self.create_pose_stamped(waypoint, next_position=next_waypoint)
+            goal_pose = self.create_pose_stamped(waypoint, next_position=next_waypoint)
             self.get_logger().info(f'Navigating to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f})')
 
             # Check if the robot can plan to the waypoint
-            if not self.can_plan_to_goal(goal_msg.pose):
+            if not self.can_plan_to_goal(goal_pose):
                 self.get_logger().warning(f'Cannot plan to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f}), skipping.')
                 continue
 
-            send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
+            # Attempt to reach the waypoint with retries
+            success = self.navigate_to_pose_with_retries(goal_pose, retries=3)
+            if not success and self.recovery_behavior_enabled:
+                self.perform_recovery_behavior()
+
+    def navigate_to_pose_with_retries(self, goal_pose, retries=3):
+        attempt = 0
+        while attempt < retries:
+            attempt += 1
+            self.get_logger().info(f'Attempt {attempt} to navigate to waypoint.')
+            send_goal_future = self.navigator.send_goal_async(NavigateToPose.Goal(pose=goal_pose), feedback_callback=self.feedback_callback)
             send_goal_future.add_done_callback(self.goal_response_callback)
 
-            # Wait for the result
-            rclpy.spin_until_future_complete(self, self.result_future)
+            # Wait for the result with a timeout
+            result_future = self.result_future
+            try:
+                rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
+                status = result_future.result().status
+                if status == GoalStatus.STATUS_SUCCEEDED:
+                    self.get_logger().info('Waypoint reached!')
+                    return True
+                else:
+                    self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
+            except Exception as e:
+                self.get_logger().error(f'Exception while waiting for goal result: {e}')
 
-            status = self.result_future.result().status
-            if status != GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().warning(f'Failed to reach waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f}), skipping.')
-                continue
+        self.get_logger().error('Failed to reach waypoint after multiple attempts.')
+        return False
+
+    def perform_recovery_behavior(self):
+        self.get_logger().info('Performing recovery behavior.')
+        # Example recovery behavior: rotate in place
+        self.rotate_in_place()
+
+    def rotate_in_place(self):
+        # Implement rotation in place
+        # This is a simple example using a Twist publisher
+        from geometry_msgs.msg import Twist
+        cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        twist = Twist()
+        twist.angular.z = 0.5  # Rotate at 0.5 rad/s
+        duration = 5.0  # Rotate for 5 seconds
+        start_time = self.get_clock().now()
+        while (self.get_clock().now() - start_time).nanoseconds < duration * 1e9:
+            cmd_vel_pub.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0.1)
+        # Stop rotation
+        twist.angular.z = 0.0
+        cmd_vel_pub.publish(twist)
+        self.get_logger().info('Recovery behavior completed.')
 
     def can_plan_to_goal(self, goal_pose):
         # Use the GetPlan service to check if a path exists to the goal
@@ -165,11 +215,11 @@ class BoustrophedonExplorer(Node):
         req = GetPlan.Request()
         req.start = start_pose
         req.goal = goal_pose
-        req.tolerance = 0.5
+        req.tolerance = 0.5  # meters
 
-        self.get_plan_client.wait_for_service(timeout_sec=1.0)
         future = self.get_plan_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+
         if future.result() is not None:
             path = future.result().plan
             if len(path.poses) > 0:
@@ -185,6 +235,7 @@ class BoustrophedonExplorer(Node):
         pose.header.frame_id = 'map'
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.pose.position = position
+
         if next_position is not None:
             dx = next_position.x - position.x
             dy = next_position.y - position.y
@@ -193,6 +244,7 @@ class BoustrophedonExplorer(Node):
             pose.pose.orientation = quaternion
         else:
             pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+
         return pose
 
     def euler_to_quaternion(self, roll, pitch, yaw):
@@ -231,29 +283,21 @@ class BoustrophedonExplorer(Node):
 
             self.get_logger().info('Goal accepted :)')
             self.result_future = goal_handle.get_result_async()
-            self.result_future.add_done_callback(self.get_result_callback)
         except Exception as e:
             self.get_logger().error(f'Exception in goal_response_callback: {e}')
             self.result_future = None
 
-    def get_result_callback(self, future):
-        try:
-            status = future.result().status
-            if status == GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().info('Waypoint reached!')
-            else:
-                self.get_logger().info(f'Goal failed with status: {status}')
-        except Exception as e:
-            self.get_logger().error(f'Exception in get_result_callback: {e}')
-
     def feedback_callback(self, feedback_msg):
-        # Process feedback if needed
+        # Optionally process feedback here
         pass
 
 def main(args=None):
     rclpy.init(args=args)
     explorer = BoustrophedonExplorer()
-    rclpy.spin(explorer)
+    try:
+        rclpy.spin(explorer)
+    except KeyboardInterrupt:
+        pass
     explorer.destroy_node()
     rclpy.shutdown()
 
