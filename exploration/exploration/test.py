@@ -41,7 +41,7 @@ class BoustrophedonExplorer(Node):
         self.get_logger().info('Action server available.')
         
         # 파라미터 선언
-        self.declare_parameter('safe_distance', 0.3)  # 미터 단위
+        self.declare_parameter('safe_distance', 0.4)  # 미터 단위
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
