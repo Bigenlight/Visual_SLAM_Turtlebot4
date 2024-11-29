@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped, Point
+from geometry_msgs.msg import PoseStamped, Point, Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
@@ -9,6 +9,8 @@ import numpy as np
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs
 from geometry_msgs.msg import TransformStamped
+from rclpy.duration import Duration
+import math
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -20,13 +22,23 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
+        self.max_frontier_distance = 5.0  # 최대 탐사 거리 (미터 단위)
+        self.min_frontier_distance = 0.5  # 최소 목표 거리 (미터 단위)
+        self.max_retries = 3  # 목표 재시도 횟수
+        self.retry_count = 0
+        self.goal_timeout = 60.0  # 목표 도달 타임아웃 (초 단위)
+
+        # 퍼블리셔 추가: cmd_vel 토픽에 정지 명령을 보내기 위해
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
         # Set up TF listener to get robot's current pose
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Wait for the action server to be ready
+        self.get_logger().info('Waiting for NavigateToPose action server...')
         self.navigator.wait_for_server()
+        self.get_logger().info('NavigateToPose action server ready.')
 
     def map_callback(self, msg):
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -43,10 +55,17 @@ class FrontierExplorer(Node):
         if not frontiers:
             self.get_logger().info('Exploration complete!')
             self.exploring = False
+            self.stop_robot()
             return
 
-        # Select the closest frontier
+        # Select the closest valid frontier within min and max distance
         goal_position = self.select_frontier(frontiers)
+
+        if goal_position is None:
+            self.get_logger().info('No reachable frontiers found within the specified distance range.')
+            self.exploring = False
+            self.stop_robot()
+            return
 
         # Create and send a navigation goal
         goal_msg = NavigateToPose.Goal()
@@ -56,10 +75,16 @@ class FrontierExplorer(Node):
         goal_msg.pose.pose.position = goal_position
         goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
 
-        self.get_logger().info(f'Navigating to frontier at ({goal_position.x}, {goal_position.y})')
+        self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
 
-        send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
+        send_goal_future = self.navigator.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
         send_goal_future.add_done_callback(self.goal_response_callback)
+
+        # Start a timer for goal timeout
+        self.create_timer(self.goal_timeout, self.goal_timeout_callback, callback_group=None)
 
     def detect_frontiers(self):
         # Implement frontier detection logic
@@ -82,38 +107,44 @@ class FrontierExplorer(Node):
         return frontiers
 
     def select_frontier(self, frontiers):
-        # Select the closest frontier to the robot's current position
+        # Select the closest reachable frontier within min and max frontier distance
 
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
-            return frontiers[0]
+            return frontiers[0] if frontiers else None
 
-        # Compute distances
+        # Compute distances and filter frontiers within min and max distance
+        valid_frontiers = []
         distances = []
         for frontier in frontiers:
             dx = frontier.x - robot_position.x
             dy = frontier.y - robot_position.y
-            distance = np.hypot(dx, dy)
-            distances.append(distance)
+            distance = math.hypot(dx, dy)
+            if self.min_frontier_distance <= distance <= self.max_frontier_distance:
+                valid_frontiers.append(frontier)
+                distances.append(distance)
+
+        if not valid_frontiers:
+            return None
 
         # Select the frontier with the minimum distance
         min_index = np.argmin(distances)
-        return frontiers[min_index]
+        return valid_frontiers[min_index]
 
     def get_neighbors(self, x, y):
-        # Get valid neighboring cells (4-connected grid)
+        # Get valid neighboring cells (8-connected grid for better frontier detection)
         neighbors = []
         width = self.map_data.shape[1]
         height = self.map_data.shape[0]
-        if x > 0:
-            neighbors.append((x - 1, y))
-        if x < width - 1:
-            neighbors.append((x + 1, y))
-        if y > 0:
-            neighbors.append((x, y - 1))
-        if y < height - 1:
-            neighbors.append((x, y + 1))
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    neighbors.append((nx, ny))
         return neighbors
 
     def grid_to_map(self, x, y):
@@ -135,32 +166,69 @@ class FrontierExplorer(Node):
         if not goal_handle.accepted:
             self.get_logger().info('Goal rejected :(')
             self.exploring = False
+            self.stop_robot()
             return
 
         self.get_logger().info('Goal accepted :)')
+        self.current_goal = goal_handle
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        status = future.result().status
+        result = future.result()
+        status = result.status
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Goal succeeded!')
+            self.retry_count = 0  # Reset retry count on success
         else:
             self.get_logger().info(f'Goal failed with status: {status}')
+            self.retry_count += 1
+            if self.retry_count >= self.max_retries:
+                self.get_logger().warn('Maximum retries reached. Stopping exploration.')
+                self.exploring = False
+                self.stop_robot()
+                return
+            else:
+                self.get_logger().info('Retrying with a new frontier.')
 
-        # After reaching the goal, look for the next frontier
+        # After reaching the goal or failing, look for the next frontier
         self.find_and_navigate_to_frontier()
 
     def feedback_callback(self, feedback_msg):
         # Process feedback from the action server if needed
         pass
 
+    def goal_timeout_callback(self):
+        if self.current_goal is not None:
+            self.get_logger().warn('Goal timeout reached. Cancelling the current goal.')
+            self.navigator.async_cancel_goal(self.current_goal)  # 수정된 메서드 호출
+            self.current_goal = None
+            self.exploring = False  # Reset exploring flag to allow retry
+            self.stop_robot()
+            self.find_and_navigate_to_frontier()
+
+    def stop_robot(self):
+        # Send zero velocity to stop the robot
+        stop_msg = Twist()
+        stop_msg.linear.x = 0.0
+        stop_msg.linear.y = 0.0
+        stop_msg.linear.z = 0.0
+        stop_msg.angular.x = 0.0
+        stop_msg.angular.y = 0.0
+        stop_msg.angular.z = 0.0
+        self.cmd_vel_publisher.publish(stop_msg)
+        self.get_logger().info('Sent stop command to the robot.')
+
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
-    rclpy.spin(explorer)
-    explorer.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(explorer)
+    except KeyboardInterrupt:
+        explorer.get_logger().info('Keyboard interrupt, shutting down.')
+    finally:
+        explorer.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

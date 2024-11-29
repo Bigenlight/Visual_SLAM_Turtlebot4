@@ -27,8 +27,12 @@ setup(
     entry_points={
         'console_scripts': [
             'exploration_node = exploration.exploration:main',
+<<<<<<< HEAD
             'exploration_kwi = exploration.exploration_kwi:main',
             'test_node = exploration.test:main',
+=======
+            'exploration_node_kwi = exploration.exploration_kwi:main',
+>>>>>>> 4890bed36f831e29feb27327c7bdd6f902a6ea57
         ],
     },
 )
