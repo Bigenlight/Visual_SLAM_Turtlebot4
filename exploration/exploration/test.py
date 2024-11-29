@@ -14,7 +14,6 @@ import scipy.ndimage
 from sklearn.cluster import DBSCAN
 from visualization_msgs.msg import Marker, MarkerArray
 
-
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -30,6 +29,9 @@ class FrontierExplorer(Node):
         self.map_data = None
         self.map_info = None
         self.exploring = False
+        self.waypoints = []
+        self.current_waypoint_index = 0
+        self.goal_handle = None
 
         # TF 리스너 설정
         self.tf_buffer = Buffer()
@@ -94,7 +96,9 @@ class FrontierExplorer(Node):
         # 웨이포인트 생성
         waypoints = self.generate_waypoints(frontiers)
         if waypoints:
-            self.follow_waypoints(waypoints)
+            self.waypoints = waypoints
+            self.current_waypoint_index = 0
+            self.send_next_waypoint()
         else:
             self.get_logger().info('No valid waypoints found.')
             self.exploring = False
@@ -198,79 +202,57 @@ class FrontierExplorer(Node):
 
         self.marker_pub.publish(marker_array)
 
-    def follow_waypoints(self, waypoints):
-        for idx, waypoint in enumerate(waypoints):
+    def send_next_waypoint(self):
+        if self.current_waypoint_index < len(self.waypoints):
+            waypoint = self.waypoints[self.current_waypoint_index]
             goal_pose = self.create_pose_stamped(waypoint)
-            self.get_logger().info(f'Navigating to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f})')
+            self.get_logger().info(f'Sending goal to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} at ({waypoint.x:.2f}, {waypoint.y:.2f})')
+            self.send_goal(goal_pose)
+        else:
+            self.get_logger().info('All waypoints have been processed.')
+            self.exploring = False
+            rclpy.shutdown()
 
-            # 타임아웃과 회복 행동을 포함한 목표 이동 시도
-            success = self.navigate_to_pose_with_timeout(goal_pose, timeout=self.stuck_timeout)
-            if not success and self.recovery_behavior_enabled:
-                self.perform_recovery_behavior()
-                # 회복 후 재시도
-                success = self.navigate_to_pose_with_timeout(goal_pose, timeout=self.stuck_timeout)
-                if not success:
-                    self.get_logger().warning('Failed to reach waypoint after recovery. Skipping to next waypoint.')
-                    continue
-
-    def navigate_to_pose_with_timeout(self, goal_pose, timeout=60.0):
-        self.get_logger().info('Sending goal to the action server.')
+    def send_goal(self, goal_pose):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal_pose
 
+        self.get_logger().info('Sending goal to the action server.')
         send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        goal_handle = send_goal_future.result()
+        send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warning('Goal rejected by the action server.')
-            return False
+            self.current_waypoint_index += 1
+            self.send_next_waypoint()
+            return
 
-        self.get_logger().info('Goal accepted. Monitoring progress...')
-        start_time = self.get_clock().now()
-        last_position = self.get_robot_pose()
-        if last_position is None:
-            self.get_logger().warning('Cannot get initial robot position. Proceeding without movement check.')
+        self.get_logger().info('Goal accepted by the action server.')
+        self.goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(self.get_result_callback)
 
-        # 이동하지 않은 시간 측정을 위한 변수 초기화
-        time_not_moved = 0.0
-        last_movement_time = self.get_clock().now()
+    def get_result_callback(self, future):
+        result = future.result().result
+        status = future.result().status
 
-        while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=1.0)
-            status = goal_handle.status
-            if status == GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().info('Waypoint reached!')
-                return True
-            elif status in [GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_CANCELED]:
-                self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
-                return False
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('Waypoint reached successfully!')
+        else:
+            self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
 
-            # 타임아웃 확인
-            current_time = self.get_clock().now()
-            if (current_time - start_time).nanoseconds > timeout * 1e9:
-                self.get_logger().warning('Timeout reached while navigating to waypoint. Cancelling goal.')
-                goal_handle.cancel_goal_async()
-                return False
+        # 다음 웨이포인트로 이동
+        self.current_waypoint_index += 1
+        self.send_next_waypoint()
 
-            # 로봇의 이동 거리 확인
-            current_position = self.get_robot_pose()
-            if current_position is not None and last_position is not None:
-                distance_moved = math.hypot(
-                    current_position.x - last_position.x,
-                    current_position.y - last_position.y
-                )
-                if distance_moved < 0.01:  # 1cm 미만 이동 시
-                    time_not_moved = (current_time - last_movement_time).nanoseconds / 1e9
-                    if time_not_moved >= 1.5:
-                        self.get_logger().warning('Robot has not moved for 1.5 seconds. Cancelling goal.')
-                        goal_handle.cancel_goal_async()
-                        return False
-                else:
-                    last_position = current_position
-                    last_movement_time = current_time
-                    time_not_moved = 0.0
+    def follow_waypoints(self, waypoints):
+        # 이 메서드는 더 이상 사용되지 않습니다.
+        pass
 
-        return False
+    def navigate_to_pose_with_timeout(self, goal_pose, timeout=60.0):
+        # 이 메서드는 더 이상 사용되지 않습니다.
+        pass
 
     def perform_recovery_behavior(self):
         self.get_logger().info('Performing recovery behavior.')
@@ -323,7 +305,6 @@ class FrontierExplorer(Node):
 
     def get_robot_pose(self):
         try:
-            now = rclpy.time.Time()
             trans = self.tf_buffer.lookup_transform(
                 'map',
                 'base_link',
@@ -340,7 +321,6 @@ class FrontierExplorer(Node):
         # 피드백 처리 가능 (현재는 생략)
         pass
 
-
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
@@ -350,7 +330,6 @@ def main(args=None):
         pass
     explorer.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
