@@ -184,11 +184,10 @@ class FrontierExplorer(Node):
     def adjust_waypoint_position(self, center):
         """
         웨이포인트를 벽과 벽 중앙에 위치시키기 위해 조정합니다.
-        현재는 간단하게 벽 중앙을 목표로 삼습니다.
+        현재는 간단하게 중앙에 위치하도록 유지.
         필요에 따라 추가적인 로직을 구현할 수 있습니다.
         """
-        # 현재 로직에서는 별도의 조정 없이 중앙에 위치하도록 유지
-        # 추가적인 조정이 필요한 경우 여기서 구현
+        # 추가적인 조정 로직이 필요한 경우 여기서 구현
         waypoint = Point(x=center[0], y=center[1], z=0.0)
         return waypoint
 
@@ -237,9 +236,33 @@ class FrontierExplorer(Node):
 
     def send_next_waypoint(self):
         if self.current_waypoint_index < len(self.waypoints):
-            waypoint = self.waypoints[self.current_waypoint_index]
-            goal_pose = self.create_pose_stamped(waypoint)
-            self.get_logger().info(f'Sending goal to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} at ({waypoint.x:.2f}, {waypoint.y:.2f})')
+            target_waypoint = self.waypoints[self.current_waypoint_index]
+
+            current_pose = self.get_robot_pose()
+            if current_pose is None:
+                self.get_logger().warn('Cannot get robot pose. Skipping waypoint.')
+                self.current_waypoint_index += 1
+                self.send_next_waypoint()
+                return
+
+            # 현재 위치와 목표 웨이포인트 간의 거리 계산
+            dx = target_waypoint.x - current_pose.x
+            dy = target_waypoint.y - current_pose.y
+            distance = math.sqrt(dx**2 + dy**2)
+
+            # 웨이포인트가 너무 멀면 0.3m 간격으로 분할
+            if distance > self.waypoint_spacing:
+                new_waypoints = self.split_waypoint(current_pose, target_waypoint, self.waypoint_spacing)
+                if new_waypoints:
+                    # 현재 웨이포인트를 분할된 웨이포인트로 대체
+                    self.waypoints = self.waypoints[:self.current_waypoint_index] + new_waypoints + self.waypoints[self.current_waypoint_index + 1:]
+                    self.get_logger().info(f'Waypoint too far ({distance:.2f}m). Splitting into {len(new_waypoints)} smaller waypoints.')
+                self.send_next_waypoint()
+                return
+
+            # 웨이포인트가 적절한 거리면 목표 전송
+            goal_pose = self.create_pose_stamped(target_waypoint)
+            self.get_logger().info(f'Sending goal to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} at ({target_waypoint.x:.2f}, {target_waypoint.y:.2f})')
             self.send_goal(goal_pose)
         else:
             self.get_logger().info('All current waypoints have been processed. Checking for new frontiers...')
@@ -291,8 +314,15 @@ class FrontierExplorer(Node):
         # 현재 목표가 활성화되어 있다면 취소
         if self.goal_handle is not None:
             self.get_logger().info('Cancelling current goal due to being stuck.')
-            cancel_future = self.goal_handle.cancel_goal_async()  # 수정된 부분
-            cancel_future.add_done_callback(self.cancel_goal_callback)
+            try:
+                cancel_future = self.goal_handle.cancel_goal_async()  # 수정된 부분
+                cancel_future.add_done_callback(self.cancel_goal_callback)
+            except AttributeError as e:
+                self.get_logger().error(f'Error cancelling goal: {e}')
+                self.get_logger().info('Skipping goal cancellation and performing recovery.')
+                self.rotate_in_place()
+                self.get_logger().info('Recovery behavior completed.')
+                self.send_next_waypoint()
         else:
             # 목표가 없다면 회전 후 다음 웨이포인트 시도
             self.rotate_in_place()
@@ -451,6 +481,29 @@ class FrontierExplorer(Node):
             self.last_movement_time = self.get_clock().now()
 
         self.last_pose = current_pose
+
+    def split_waypoint(self, current_pos, target_pos, step=0.3):
+        """
+        목표 웨이포인트를 현재 위치로부터 step 간격으로 분할하여 여러 개의 웨이포인트 리스트를 반환합니다.
+        """
+        dx = target_pos.x - current_pos.x
+        dy = target_pos.y - current_pos.y
+        distance = math.sqrt(dx**2 + dy**2)
+
+        if distance <= step:
+            return [target_pos]
+
+        num_steps = int(math.ceil(distance / step))
+        waypoints = []
+
+        for i in range(1, num_steps + 1):
+            ratio = i / num_steps
+            intermediate_x = current_pos.x + ratio * dx
+            intermediate_y = current_pos.y + ratio * dy
+            intermediate_waypoint = Point(x=intermediate_x, y=intermediate_y, z=0.0)
+            waypoints.append(intermediate_waypoint)
+
+        return waypoints
 
 def main(args=None):
     rclpy.init(args=args)
