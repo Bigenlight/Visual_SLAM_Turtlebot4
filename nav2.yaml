@@ -68,7 +68,7 @@ controller_server:
     use_sim_time: true
     controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
-    min_y_velocity_threshold: 0.1 # Reduced from 0.5 to 0.1
+    min_y_velocity_threshold: 0.5 # Reduced from 0.5 to 0.1
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
@@ -153,7 +153,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
-        inflation_radius: 0.20 # Reduced from 0.45 to 0.20
+        inflation_radius: 0.6 # Reduced from 0.45 to 0.20
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -211,7 +211,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
-        inflation_radius: 0.20 # Reduced from 0.45 to 0.20
+        inflation_radius: 0.6 # Reduced from 0.45 to 0.20
       always_send_full_costmap: true
 
 planner_server:
