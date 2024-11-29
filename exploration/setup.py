@@ -26,10 +26,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'exploration_node = exploration.exploration:main',
-            'exploration_kwi = exploration.exploration_kwi:main',
-            'test_node = exploration.test:main',
-            'exploration2_0 = exploration2_0.exploration2_0:main',
+        'exploration_node = exploration.exploration:main',
+        'exploration_kwi = exploration.exploration_kwi:main',
+        'test_node = exploration.test:main',
+        'exploration2_0 = exploration.exploration2_0:main',
         ],
-    },
+    }
 )
