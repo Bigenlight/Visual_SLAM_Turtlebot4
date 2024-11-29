@@ -8,7 +8,6 @@ from rclpy.action import ActionClient
 import numpy as np
 from tf2_ros import Buffer, TransformListener
 import math
-import tf2_ros
 from rclpy.duration import Duration
 import scipy.ndimage
 from sklearn.cluster import DBSCAN
@@ -89,9 +88,8 @@ class FrontierExplorer(Node):
         # 탐색 전선 검출
         frontiers = self.detect_frontiers()
         if frontiers is None or frontiers.size == 0:
-            self.get_logger().info('No frontiers detected.')
-            self.exploring = False
-            self.shutdown_node()
+            self.get_logger().info('No frontiers detected. Waiting for map updates...')
+            self.exploring = False  # 다음 맵 업데이트에서 다시 탐색 시도
             return
 
         # 웨이포인트 생성
@@ -101,9 +99,9 @@ class FrontierExplorer(Node):
             self.current_waypoint_index = 0
             self.send_next_waypoint()
         else:
-            self.get_logger().info('No valid waypoints found.')
+            self.get_logger().info('No valid waypoints found. Waiting for map updates...')
             self.exploring = False
-            self.shutdown_node()
+            return
 
     def detect_frontiers(self):
         # 맵 데이터에서 탐색 전선 검출
@@ -316,9 +314,10 @@ class FrontierExplorer(Node):
 
     def shutdown_node(self):
         # 노드가 안전하게 종료되도록 처리
-        self.get_logger().info('Shutting down the node safely.')
-        self.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            self.get_logger().info('Shutting down the node safely.')
+            self.destroy_node()
+            rclpy.shutdown()
 
 
 def main(args=None):
