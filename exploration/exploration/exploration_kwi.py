@@ -22,11 +22,11 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 5.0  # 최대 탐사 거리 (미터 단위)
+        self.max_frontier_distance = 2.0  # 최대 탐사 거리 (미터 단위)
         self.min_frontier_distance = 0.5  # 최소 목표 거리 (미터 단위)
         self.max_retries = 3  # 목표 재시도 횟수
         self.retry_count = 0
-        self.goal_timeout = 60.0  # 목표 도달 타임아웃 (초 단위)
+        self.goal_timeout = 15.0  # 목표 도달 타임아웃 (초 단위)
 
         # 퍼블리셔 추가: cmd_vel 토픽에 정지 명령을 보내기 위해
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
