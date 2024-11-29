@@ -7,7 +7,6 @@ from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 import numpy as np
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
-from geometry_msgs.msg import TransformStamped
 import math
 from sklearn.cluster import DBSCAN
 
@@ -44,6 +43,10 @@ class FrontierExplorer(Node):
         self.movement_threshold = 0.10  # 10 cm
         self.movement_timeout = 3.0  # 3 seconds without movement
 
+        # No-frontier timer variables
+        self.no_frontier_timer = None
+        self.no_frontier_duration = 10.0  # 10 seconds without frontiers
+
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
@@ -59,13 +62,6 @@ class FrontierExplorer(Node):
         # Initialize visited frontiers list
         self.visited_frontiers = []
         self.frontier_distance_threshold = 0.25  # 25 cm to consider a frontier as visited
-
-        # Initialize map closure monitoring
-        self.last_frontier_time = self.get_clock().now()  # Initialize with current time
-        self.map_closed_duration = 10.0  # Duration in seconds to consider the map as closed
-
-        # Create a timer to periodically check for map closure
-        self.map_closed_timer = self.create_timer(1.0, self.check_map_closed_callback)
 
     def map_callback(self, msg):
         """
@@ -86,51 +82,89 @@ class FrontierExplorer(Node):
         # Frontier detection logic
         frontiers = self.detect_frontiers()
 
-        if frontiers:
-            # Update the last frontier detection time
-            self.last_frontier_time = self.get_clock().now()
-            self.get_logger().debug(f'Frontiers detected at {self.last_frontier_time.to_sec()}.')
-
         if not frontiers:
-            self.get_logger().info('No frontiers detected. Exploration may be complete.')
-            # Exploration may be complete; however, we wait for the map closure timer to confirm
-        else:
-            # Cluster the frontiers
-            clustered_frontiers = self.cluster_frontiers(frontiers)
+            self.get_logger().info('No frontiers detected.')
+            # Start the no-frontier timer if not already started
+            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+                self.get_logger().info('Starting no-frontier timer.')
+                self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            return  # Exit without stopping exploration yet
 
-            if not clustered_frontiers:
-                self.get_logger().info('No valid frontiers after clustering.')
-                self.exploring = False
-                self.stop_robot()
-                return
+        # If frontiers are found and the no-frontier timer is running, cancel it
+        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.no_frontier_timer.cancel()
+            self.no_frontier_timer = None
+            self.get_logger().info('Frontiers detected. No-frontier timer cancelled.')
 
-            # Select the closest valid frontier within min and max distance
-            goal_position = self.select_frontier(clustered_frontiers)
+        # Cluster the frontiers
+        clustered_frontiers = self.cluster_frontiers(frontiers)
 
-            if goal_position is None:
-                self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
-                self.exploring = False
-                self.stop_robot()
-                return
+        if not clustered_frontiers:
+            self.get_logger().info('No valid frontiers after clustering.')
+            # Start the no-frontier timer if not already started
+            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+                self.get_logger().info('Starting no-frontier timer.')
+                self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            return  # Exit without stopping exploration yet
 
-            # Create and send a navigation goal
-            goal_msg = NavigateToPose.Goal()
-            goal_msg.pose = PoseStamped()
-            goal_msg.pose.header.frame_id = 'map'
-            goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-            goal_msg.pose.pose.position = goal_position
-            goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
+        # Select the closest valid frontier within min and max distance
+        goal_position = self.select_frontier(clustered_frontiers)
 
-            self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
+        if goal_position is None:
+            self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
+            # Start the no-frontier timer if not already started
+            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+                self.get_logger().info('Starting no-frontier timer.')
+                self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            return  # Exit without stopping exploration yet
 
-            send_goal_future = self.navigator.send_goal_async(
-                goal_msg,
-                feedback_callback=self.feedback_callback
-            )
-            send_goal_future.add_done_callback(self.goal_response_callback)
+        # If we have a goal, cancel the no-frontier timer if running
+        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.no_frontier_timer.cancel()
+            self.no_frontier_timer = None
+            self.get_logger().info('Valid frontier selected. No-frontier timer cancelled.')
 
-            # Start the movement monitoring timer
-            self.start_movement_monitoring()
+        # Create and send a navigation goal
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position = goal_position
+        goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
+
+        self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
+
+        send_goal_future = self.navigator.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        send_goal_future.add_done_callback(self.goal_response_callback)
+
+        # Start the movement monitoring timer
+        self.start_movement_monitoring()
+
+    def no_frontier_timer_callback(self):
+        """
+        Callback function for the no-frontier timer.
+        Stops exploration and shuts down the node after 10 seconds without frontiers.
+        """
+        self.get_logger().info('The map is closed! No new frontiers detected for 10 seconds.')
+        self.stop_robot()
+        self.shutdown()
+
+    def shutdown(self):
+        """
+        Stops exploration and shuts down the node gracefully.
+        """
+        self.get_logger().info('Shutting down the exploration node.')
+        # Cancel any running timers
+        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
+            self.movement_timer.cancel()
+        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.no_frontier_timer.cancel()
+        # Destroy the node
+        self.destroy_node()
+        rclpy.shutdown()
 
     def detect_frontiers(self):
         """
@@ -524,10 +558,10 @@ def main(args=None):
         rclpy.spin(explorer)
     except KeyboardInterrupt:
         explorer.get_logger().info('Keyboard interrupt, shutting down.')
+        explorer.shutdown()
     finally:
-        explorer.cancel_all_timers()
-        explorer.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
