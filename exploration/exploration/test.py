@@ -52,18 +52,22 @@ class FrontierExplorer(Node):
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
-        self.declare_parameter('stuck_timeout', 4.0)  # 4초 동안 움직이지 않으면 스턱으로 간주
+        self.declare_parameter('stuck_timeout', 4.0)  # 4초 동안 같은 위치에 머물러 있으면 스턱으로 간주
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
-        self.declare_parameter('waypoint_spacing', 0.5)  # 웨이포인트 간격을 0.3미터로 설정
+        self.declare_parameter('waypoint_spacing', 0.5)  # 웨이포인트 간격을 0.5미터로 설정
         self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
 
-        self.declare_parameter('robot_width', 0.3)
+        self.declare_parameter('robot_width', 0.33)
         self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
 
         self.declare_parameter('map_save_directory', '/tmp/maps')  # 맵 저장 디렉토리
         self.map_save_directory = self.get_parameter('map_save_directory').get_parameter_value().string_value
         os.makedirs(self.map_save_directory, exist_ok=True)
+
+        # 추가된 파라미터: 위치 변화 임계값
+        self.declare_parameter('position_epsilon', 0.05)  # 위치 변화 임계값 (미터 단위)
+        self.position_epsilon = self.get_parameter('position_epsilon').get_parameter_value().double_value
 
         # cmd_vel 퍼블리셔 설정 (회복 행동용)
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -77,7 +81,6 @@ class FrontierExplorer(Node):
         # 로봇의 마지막 위치 및 시간 추적
         self.last_pose = None
         self.last_movement_time = self.get_clock().now()
-        self.movement_threshold = 0.1  # 미터 단위
         self.stuck = False
 
         # 로봇 이동 모니터링을 위한 타이머 설정 (1초 간격)
@@ -466,11 +469,17 @@ class FrontierExplorer(Node):
             dx = current_pose.x - self.last_pose.x
             dy = current_pose.y - self.last_pose.y
             distance = math.sqrt(dx**2 + dy**2)
-            if distance >= self.movement_threshold:
+
+            if distance > self.position_epsilon:
+                # 로봇이 위치를 변경했을 경우
                 self.last_movement_time = self.get_clock().now()
                 self.stuck = False
+                self.get_logger().debug(f'Robot moved {distance:.2f}m, resetting stuck timer.')
             else:
+                # 로봇이 거의 움직이지 않았을 경우
                 elapsed = (self.get_clock().now() - self.last_movement_time).nanoseconds / 1e9
+                self.get_logger().debug(f'Robot has not moved beyond {self.position_epsilon}m. Elapsed time: {elapsed:.2f}s')
+
                 if elapsed >= self.stuck_timeout and not self.stuck:
                     self.get_logger().warning('Robot is stuck. Initiating recovery behavior.')
                     self.stuck = True
@@ -479,10 +488,11 @@ class FrontierExplorer(Node):
             # Initialize last_pose
             self.last_pose = current_pose
             self.last_movement_time = self.get_clock().now()
+            self.get_logger().debug('Initialized last_pose.')
 
         self.last_pose = current_pose
 
-    def split_waypoint(self, current_pos, target_pos, step=0.5):
+    def split_waypoint(self, current_pos, target_pos, step=0.3):
         """
         목표 웨이포인트를 현재 위치로부터 step 간격으로 분할하여 여러 개의 웨이포인트 리스트를 반환합니다.
         """
