@@ -11,6 +11,9 @@ import math
 import tf2_ros
 from rclpy.duration import Duration
 from skimage import measure
+import scipy.ndimage
+from sklearn.cluster import DBSCAN
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 class BoustrophedonExplorer(Node):
@@ -20,28 +23,28 @@ class BoustrophedonExplorer(Node):
         # 맵 구독자 설정
         self.map_subscriber = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10)
-        
+
         # NavigateToPose 액션 클라이언트 설정
         self.navigator = ActionClient(self, NavigateToPose, 'navigate_to_pose')
-        
+
         # 초기 변수 설정
         self.map_data = None
         self.map_info = None
         self.current_goal = None
         self.exploring = False
         self.starting_pose = None  # 시작 위치 저장
-        
+
         # TF 리스너 설정
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        
+
         # 액션 서버 대기
         self.get_logger().info('Waiting for navigate_to_pose action server...')
         self.navigator.wait_for_server()
         self.get_logger().info('Action server available.')
-        
+
         # 파라미터 선언
-        self.declare_parameter('safe_distance', 0.3)  # 미터 단위
+        self.declare_parameter('safe_distance', 0.5)  # 미터 단위
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
@@ -50,8 +53,17 @@ class BoustrophedonExplorer(Node):
         self.declare_parameter('stuck_timeout', 10.0)  # 초 단위
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
+        self.declare_parameter('waypoint_spacing', 0.5)  # 미터 단위
+        self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
+
+        self.declare_parameter('robot_width', 0.35)  # 로봇의 폭 (미터 단위)
+        self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
+
         # cmd_vel 퍼블리셔 설정 (회복 행동용)
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        # 웨이포인트 마커 퍼블리셔 설정
+        self.marker_pub = self.create_publisher(MarkerArray, 'waypoints_markers', 10)
 
         # 시작 위치 저장
         self.starting_pose = self.get_robot_pose()
@@ -64,6 +76,11 @@ class BoustrophedonExplorer(Node):
         # OccupancyGrid 데이터를 NumPy 배열로 변환
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
         self.map_info = msg.info
+
+        # Distance Transform 계산 (장애물로부터의 거리 맵)
+        free_space = self.map_data == 0
+        obstacles = self.map_data == 100
+        self.distance_transform = scipy.ndimage.distance_transform_edt(free_space) * self.map_info.resolution
 
         if not self.exploring:
             self.exploring = True
@@ -95,67 +112,88 @@ class BoustrophedonExplorer(Node):
         rclpy.shutdown()
 
     def generate_boustrophedon_path(self, region):
-        # 영역 내 자유 셀의 인덱스 추출
-        indices = np.argwhere(region)
-        if len(indices) == 0:
+        # Distance Transform 계산
+        distance_transform = scipy.ndimage.distance_transform_edt(region) * self.map_info.resolution
+
+        # 중심선 추출: 최대 거리의 80% 이상인 지점 선택
+        max_distance = distance_transform.max()
+        if max_distance == 0:
+            self.get_logger().warning('Max distance in region is zero. Skipping region.')
             return []
 
-        # 영역의 바운딩 박스 추출
-        min_y, min_x = indices.min(axis=0)
-        max_y, max_x = indices.max(axis=0)
+        threshold = max_distance * 0.8
+        centerline = distance_transform >= threshold
 
+        # 중심선을 따라 웨이포인트 생성
+        indices = np.argwhere(centerline)
+        if len(indices) == 0:
+            self.get_logger().warning('No centerline found for the region.')
+            return []
+
+        # 좌표 변환 (x, y)
+        points = indices[:, [1, 0]].astype(float)  # x, y 순서로 변경
+        points = points * self.map_info.resolution + np.array([self.map_info.origin.position.x, self.map_info.origin.position.y])
+
+        # DBSCAN 클러스터링 적용
+        clustering = DBSCAN(eps=self.waypoint_spacing, min_samples=1).fit(points)
+        cluster_centers = []
+        for cluster_label in np.unique(clustering.labels_):
+            cluster_points = points[clustering.labels_ == cluster_label]
+            center = cluster_points.mean(axis=0)
+            cluster_centers.append(center)
+
+        # 웨이포인트 생성
         waypoints = []
-        resolution = self.map_info.resolution
-        origin_x = self.map_info.origin.position.x
-        origin_y = self.map_info.origin.position.y
-
-        # 바운딩 박스 내에서 Boustrophedon 경로 생성
-        for y in range(min_y, max_y + 1):
-            row_indices = indices[indices[:, 0] == y]
-            if len(row_indices) == 0:
-                continue
-            x_values = row_indices[:, 1]
-            x_start = x_values.min()
-            x_end = x_values.max()
-
-            # 행 번호에 따라 이동 방향 번갈아 설정 (지그재그)
-            if (y - min_y) % 2 == 0:
-                x_range = range(x_start, x_end + 1)
+        for center in cluster_centers:
+            if self.is_safe_point_world(center[0], center[1]):
+                waypoint = Point(x=center[0], y=center[1], z=0.0)
+                waypoints.append(waypoint)
             else:
-                x_range = range(x_end, x_start - 1, -1)
+                self.get_logger().debug(f'Waypoint at ({center[0]:.2f}, {center[1]:.2f}) is too close to an obstacle.')
 
-            for x in x_range:
-                if region[y, x]:
-                    mx = origin_x + (x + 0.5) * resolution
-                    my = origin_y + (y + 0.5) * resolution
-
-                    # 장애물로부터 안전 거리 확보
-                    if self.is_safe_point(x, y):
-                        waypoint = Point(x=mx, y=my, z=0.0)
-                        waypoints.append(waypoint)
-                    else:
-                        self.get_logger().debug(f'Waypoint at ({mx:.2f}, {my:.2f}) is too close to an obstacle.')
+        # 웨이포인트 시각화
+        self.visualize_waypoints(waypoints)
 
         self.get_logger().info(f'Generated {len(waypoints)} waypoints for the region.')
         return waypoints
 
-    def is_safe_point(self, x, y):
-        # 주변 셀을 검사하여 장애물로부터 안전 거리 이상 떨어져 있는지 확인
-        safe_distance_cells = int(self.safe_distance / self.map_info.resolution)
-        for dy in range(-safe_distance_cells, safe_distance_cells + 1):
-            for dx in range(-safe_distance_cells, safe_distance_cells + 1):
-                nx = x + dx
-                ny = y + dy
-                if nx < 0 or nx >= self.map_data.shape[1] or ny < 0 or ny >= self.map_data.shape[0]:
-                    return False  # 맵 외부
-                if self.map_data[ny, nx] == 100:
-                    return False  # 장애물 인근
-        return True
+    def is_safe_point_world(self, mx, my):
+        # 월드 좌표를 맵 좌표로 변환
+        x = int((mx - self.map_info.origin.position.x) / self.map_info.resolution)
+        y = int((my - self.map_info.origin.position.y) / self.map_info.resolution)
+
+        if x < 0 or x >= self.map_data.shape[1] or y < 0 or y >= self.map_data.shape[0]:
+            return False  # 맵 외부
+
+        distance = self.distance_transform[y, x]
+        return distance >= self.safe_distance
+
+    def visualize_waypoints(self, waypoints):
+        marker_array = MarkerArray()
+        for idx, wp in enumerate(waypoints):
+            marker = Marker()
+            marker.header.frame_id = 'map'
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = 'waypoints'
+            marker.id = idx
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position = wp
+            marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+            marker.scale.x = 0.2
+            marker.scale.y = 0.2
+            marker.scale.z = 0.2
+            marker.color.a = 1.0
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker_array.markers.append(marker)
+
+        self.marker_pub.publish(marker_array)
 
     def follow_waypoints(self, waypoints):
         for idx, waypoint in enumerate(waypoints):
-            next_waypoint = waypoints[idx + 1] if idx + 1 < len(waypoints) else None
-            goal_pose = self.create_pose_stamped(waypoint, next_position=next_waypoint)
+            goal_pose = self.create_pose_stamped(waypoint)
             self.get_logger().info(f'Navigating to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f})')
 
             # 타임아웃과 회복 행동을 포함한 목표 이동 시도
@@ -165,7 +203,10 @@ class BoustrophedonExplorer(Node):
 
     def navigate_to_pose_with_timeout(self, goal_pose, timeout=60.0):
         self.get_logger().info('Sending goal to the action server.')
-        send_goal_future = self.navigator.send_goal_async(NavigateToPose.Goal(pose=goal_pose), feedback_callback=self.feedback_callback)
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = goal_pose.pose
+
+        send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
         rclpy.spin_until_future_complete(self, send_goal_future)
         goal_handle = send_goal_future.result()
         if not goal_handle.accepted:
@@ -180,8 +221,8 @@ class BoustrophedonExplorer(Node):
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=1.0)
-            if goal_handle.goal_status.status in [GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_REJECTED, GoalStatus.STATUS_CANCELLED]:
-                status = goal_handle.goal_status.status
+            status = goal_handle.goal_status.status
+            if status in [GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_REJECTED, GoalStatus.STATUS_CANCELLED]:
                 if status == GoalStatus.STATUS_SUCCEEDED:
                     self.get_logger().info('Waypoint reached!')
                     return True
@@ -261,14 +302,14 @@ class BoustrophedonExplorer(Node):
         return pose
 
     def euler_to_quaternion(self, roll, pitch, yaw):
-        qx = math.sin(roll/2) * math.cos(pitch/2) * math.cos(yaw/2) - \
-             math.cos(roll/2) * math.sin(pitch/2) * math.sin(yaw/2)
-        qy = math.cos(roll/2) * math.sin(pitch/2) * math.cos(yaw/2) + \
-             math.sin(roll/2) * math.cos(pitch/2) * math.sin(yaw/2)
-        qz = math.cos(roll/2) * math.cos(pitch/2) * math.sin(yaw/2) - \
-             math.sin(roll/2) * math.sin(pitch/2) * math.cos(yaw/2)
-        qw = math.cos(roll/2) * math.cos(pitch/2) * math.cos(yaw/2) + \
-             math.sin(roll/2) * math.sin(pitch/2) * math.sin(yaw/2)
+        qx = math.sin(roll / 2) * math.cos(pitch / 2) * math.cos(yaw / 2) - \
+             math.cos(roll / 2) * math.sin(pitch / 2) * math.sin(yaw / 2)
+        qy = math.cos(roll / 2) * math.sin(pitch / 2) * math.cos(yaw / 2) + \
+             math.sin(roll / 2) * math.cos(pitch / 2) * math.sin(yaw / 2)
+        qz = math.cos(roll / 2) * math.cos(pitch / 2) * math.sin(yaw / 2) - \
+             math.sin(roll / 2) * math.sin(pitch / 2) * math.cos(yaw / 2)
+        qw = math.cos(roll / 2) * math.cos(pitch / 2) * math.cos(yaw / 2) + \
+             math.sin(roll / 2) * math.sin(pitch / 2) * math.sin(yaw / 2)
         return Quaternion(x=qx, y=qy, z=qz, w=qw)
 
     def get_robot_pose(self):
@@ -286,9 +327,8 @@ class BoustrophedonExplorer(Node):
             self.get_logger().error(f'Could not get robot pose: {e}')
             return None
 
-    def goal_response_callback(self, future):
-        # 현재 로직에서는 별도의 처리 필요 없음
-        pass
+    def distance_between(self, p1, p2):
+        return math.hypot(p2.x - p1.x, p2.y - p1.y)
 
     def feedback_callback(self, feedback_msg):
         # 피드백 처리 가능 (현재는 생략)
