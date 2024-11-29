@@ -14,6 +14,7 @@ from skimage import measure
 import scipy.ndimage
 from sklearn.cluster import DBSCAN
 from visualization_msgs.msg import Marker, MarkerArray
+from nav_msgs.msg import MapMetaData
 
 
 class BoustrophedonExplorer(Node):
@@ -33,6 +34,7 @@ class BoustrophedonExplorer(Node):
         self.current_goal = None
         self.exploring = False
         self.starting_pose = None  # 시작 위치 저장
+        self.last_map_data = None  # 이전 맵 데이터 저장
 
         # TF 리스너 설정
         self.tf_buffer = Buffer()
@@ -50,7 +52,7 @@ class BoustrophedonExplorer(Node):
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
-        self.declare_parameter('stuck_timeout', 10.0)  # 초 단위
+        self.declare_parameter('stuck_timeout', 30.0)  # 초 단위
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
         self.declare_parameter('waypoint_spacing', 0.5)  # 미터 단위
@@ -66,11 +68,15 @@ class BoustrophedonExplorer(Node):
         self.marker_pub = self.create_publisher(MarkerArray, 'waypoints_markers', 10)
 
         # 시작 위치 저장
+        self.timer = self.create_timer(1.0, self.initialize_starting_pose)
+
+    def initialize_starting_pose(self):
         self.starting_pose = self.get_robot_pose()
-        if self.starting_pose is None:
-            self.get_logger().error('Could not get starting position.')
-        else:
+        if self.starting_pose is not None:
             self.get_logger().info(f'Starting position recorded at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
+            self.destroy_timer(self.timer)
+        else:
+            self.get_logger().warning('Waiting for robot pose to initialize starting position.')
 
     def map_callback(self, msg):
         # OccupancyGrid 데이터를 NumPy 배열로 변환
@@ -80,54 +86,61 @@ class BoustrophedonExplorer(Node):
         # Distance Transform 계산 (장애물로부터의 거리 맵)
         free_space = self.map_data == 0
         obstacles = self.map_data == 100
-        self.distance_transform = scipy.ndimage.distance_transform_edt(free_space) * self.map_info.resolution
+        unknown = self.map_data == -1
+
+        # 탐색되지 않은 영역이 남아있는지 확인
+        if not np.any(unknown):
+            if self.exploring:
+                self.get_logger().info('Exploration complete! Returning to starting position...')
+                self.return_to_start()
+                self.exploring = False
+                rclpy.shutdown()
+            else:
+                self.get_logger().info('Map is fully explored.')
+            return
 
         if not self.exploring:
             self.exploring = True
             self.plan_and_execute_coverage()
 
     def plan_and_execute_coverage(self):
-        # Boustrophedon 분할 및 경로 계획
-        free_space = self.map_data == 0  # 자유 공간
-        labeled_map, num_features = measure.label(free_space, connectivity=1, return_num=True)
+        # 미탐색 영역 (unknown) 주변의 자유 공간을 탐색
+        unknown = self.map_data == -1
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        dilated_unknown = scipy.ndimage.binary_dilation(unknown, structure=kernel)
+        exploration_frontier = dilated_unknown & (self.map_data == 0)
 
-        if num_features == 0:
-            self.get_logger().info('No free space to explore.')
+        if not np.any(exploration_frontier):
+            self.get_logger().info('No exploration frontier found.')
             self.exploring = False
             self.return_to_start()
+            rclpy.shutdown()
             return
 
-        self.get_logger().info(f'Number of regions to explore: {num_features}')
+        # 탐색 전선 영역에서 웨이포인트 생성
+        waypoints = self.generate_waypoints(exploration_frontier)
+        if waypoints:
+            self.follow_waypoints(waypoints)
+        else:
+            self.get_logger().info('No valid waypoints found.')
+            self.exploring = False
+            self.return_to_start()
+            rclpy.shutdown()
 
-        # 각 영역에 대한 웨이포인트 생성 및 탐색
-        for region_label in range(1, num_features + 1):
-            region = labeled_map == region_label
-            waypoints = self.generate_boustrophedon_path(region)
-            if waypoints:
-                self.follow_waypoints(waypoints)
-
-        self.get_logger().info('Coverage complete! Returning to starting position...')
-        self.return_to_start()
-        self.exploring = False
-        rclpy.shutdown()
-
-    def generate_boustrophedon_path(self, region):
+    def generate_waypoints(self, frontier):
         # Distance Transform 계산
-        distance_transform = scipy.ndimage.distance_transform_edt(region) * self.map_info.resolution
+        distance_transform = scipy.ndimage.distance_transform_edt(self.map_data != 0) * self.map_info.resolution
 
-        # 중심선 추출: 최대 거리의 80% 이상인 지점 선택
-        max_distance = distance_transform.max()
-        if max_distance == 0:
-            self.get_logger().warning('Max distance in region is zero. Skipping region.')
-            return []
+        # 안전 거리 이상인 지점 선택
+        safe_region = distance_transform >= self.safe_distance
 
-        threshold = max_distance * 0.8
-        centerline = distance_transform >= threshold
+        # 탐색 전선과 안전 영역의 교집합
+        valid_points = frontier & safe_region
 
-        # 중심선을 따라 웨이포인트 생성
-        indices = np.argwhere(centerline)
+        # 유효한 포인트 인덱스 추출
+        indices = np.argwhere(valid_points)
         if len(indices) == 0:
-            self.get_logger().warning('No centerline found for the region.')
+            self.get_logger().warning('No valid points found in frontier.')
             return []
 
         # 좌표 변환 (x, y)
@@ -145,28 +158,14 @@ class BoustrophedonExplorer(Node):
         # 웨이포인트 생성
         waypoints = []
         for center in cluster_centers:
-            if self.is_safe_point_world(center[0], center[1]):
-                waypoint = Point(x=center[0], y=center[1], z=0.0)
-                waypoints.append(waypoint)
-            else:
-                self.get_logger().debug(f'Waypoint at ({center[0]:.2f}, {center[1]:.2f}) is too close to an obstacle.')
+            waypoint = Point(x=center[0], y=center[1], z=0.0)
+            waypoints.append(waypoint)
 
         # 웨이포인트 시각화
         self.visualize_waypoints(waypoints)
 
-        self.get_logger().info(f'Generated {len(waypoints)} waypoints for the region.')
+        self.get_logger().info(f'Generated {len(waypoints)} waypoints for exploration.')
         return waypoints
-
-    def is_safe_point_world(self, mx, my):
-        # 월드 좌표를 맵 좌표로 변환
-        x = int((mx - self.map_info.origin.position.x) / self.map_info.resolution)
-        y = int((my - self.map_info.origin.position.y) / self.map_info.resolution)
-
-        if x < 0 or x >= self.map_data.shape[1] or y < 0 or y >= self.map_data.shape[0]:
-            return False  # 맵 외부
-
-        distance = self.distance_transform[y, x]
-        return distance >= self.safe_distance
 
     def visualize_waypoints(self, waypoints):
         marker_array = MarkerArray()
@@ -200,11 +199,16 @@ class BoustrophedonExplorer(Node):
             success = self.navigate_to_pose_with_timeout(goal_pose, timeout=self.stuck_timeout)
             if not success and self.recovery_behavior_enabled:
                 self.perform_recovery_behavior()
+                # 회복 후 재시도
+                success = self.navigate_to_pose_with_timeout(goal_pose, timeout=self.stuck_timeout)
+                if not success:
+                    self.get_logger().warning('Failed to reach waypoint after recovery. Skipping to next waypoint.')
+                    continue
 
     def navigate_to_pose_with_timeout(self, goal_pose, timeout=60.0):
         self.get_logger().info('Sending goal to the action server.')
         goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = goal_pose.pose
+        goal_msg.pose = goal_pose
 
         send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
         rclpy.spin_until_future_complete(self, send_goal_future)
@@ -221,14 +225,13 @@ class BoustrophedonExplorer(Node):
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=1.0)
-            status = goal_handle.goal_status.status
-            if status in [GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_REJECTED, GoalStatus.STATUS_CANCELLED]:
-                if status == GoalStatus.STATUS_SUCCEEDED:
-                    self.get_logger().info('Waypoint reached!')
-                    return True
-                else:
-                    self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
-                    return False
+            status = goal_handle.status
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info('Waypoint reached!')
+                return True
+            elif status in [GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_CANCELED]:
+                self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
+                return False
 
             # 타임아웃 확인
             current_time = self.get_clock().now()
@@ -297,7 +300,12 @@ class BoustrophedonExplorer(Node):
             quaternion = self.euler_to_quaternion(0, 0, yaw)
             pose.pose.orientation = quaternion
         else:
-            pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+            # 현재 방향 유지
+            current_orientation = self.get_robot_orientation()
+            if current_orientation is not None:
+                pose.pose.orientation = current_orientation
+            else:
+                pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
 
         return pose
 
@@ -318,33 +326,11 @@ class BoustrophedonExplorer(Node):
             trans = self.tf_buffer.lookup_transform(
                 'map',
                 'base_link',
-                now,
+                rclpy.time.Time(),
                 timeout=Duration(seconds=1.0))
             return trans.transform.translation
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
             self.get_logger().error(f'Could not get robot pose: {e}')
-            return None
-
-    def distance_between(self, p1, p2):
-        return math.hypot(p2.x - p1.x, p2.y - p1.y)
-
-    def feedback_callback(self, feedback_msg):
-        # 피드백 처리 가능 (현재는 생략)
-        pass
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    explorer = BoustrophedonExplorer()
-    try:
-        rclpy.spin(explorer)
-    except KeyboardInterrupt:
-        pass
-    explorer.destroy_node()
-    rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
+          
