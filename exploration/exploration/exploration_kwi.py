@@ -9,6 +9,9 @@ import numpy as np
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs
 from geometry_msgs.msg import TransformStamped
+from rclpy.duration import Duration
+from rclpy.task import Future
+import math
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -20,13 +23,17 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
+        self.max_goal_distance = 5.0  # 최대 목표 거리 (미터 단위)
+        self.goal_timeout = 60.0  # 목표 도달 타임아웃 (초 단위)
 
         # Set up TF listener to get robot's current pose
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Wait for the action server to be ready
+        self.get_logger().info('Waiting for NavigateToPose action server...')
         self.navigator.wait_for_server()
+        self.get_logger().info('NavigateToPose action server ready.')
 
     def map_callback(self, msg):
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -45,8 +52,13 @@ class FrontierExplorer(Node):
             self.exploring = False
             return
 
-        # Select the closest frontier
+        # Select the closest valid frontier within max_goal_distance
         goal_position = self.select_frontier(frontiers)
+
+        if goal_position is None:
+            self.get_logger().info('No valid frontiers within the maximum distance.')
+            self.exploring = False
+            return
 
         # Create and send a navigation goal
         goal_msg = NavigateToPose.Goal()
@@ -56,10 +68,16 @@ class FrontierExplorer(Node):
         goal_msg.pose.pose.position = goal_position
         goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
 
-        self.get_logger().info(f'Navigating to frontier at ({goal_position.x}, {goal_position.y})')
+        self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
 
-        send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
+        send_goal_future = self.navigator.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
         send_goal_future.add_done_callback(self.goal_response_callback)
+
+        # Start a timer for goal timeout
+        self.create_timer(self.goal_timeout, self.goal_timeout_callback, callback_group=None)
 
     def detect_frontiers(self):
         # Implement frontier detection logic
@@ -82,24 +100,30 @@ class FrontierExplorer(Node):
         return frontiers
 
     def select_frontier(self, frontiers):
-        # Select the closest frontier to the robot's current position
+        # Select the closest frontier to the robot's current position within max_goal_distance
 
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
-            return frontiers[0]
+            return frontiers[0] if frontiers else None
 
-        # Compute distances
+        valid_frontiers = []
         distances = []
+
         for frontier in frontiers:
             dx = frontier.x - robot_position.x
             dy = frontier.y - robot_position.y
-            distance = np.hypot(dx, dy)
-            distances.append(distance)
+            distance = math.hypot(dx, dy)
+            if distance <= self.max_goal_distance:
+                valid_frontiers.append(frontier)
+                distances.append(distance)
+
+        if not valid_frontiers:
+            return None
 
         # Select the frontier with the minimum distance
         min_index = np.argmin(distances)
-        return frontiers[min_index]
+        return valid_frontiers[min_index]
 
     def get_neighbors(self, x, y):
         # Get valid neighboring cells (4-connected grid)
@@ -138,15 +162,20 @@ class FrontierExplorer(Node):
             return
 
         self.get_logger().info('Goal accepted :)')
+        self.current_goal = goal_handle
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        status = future.result().status
+        result = future.result()
+        status = result.status
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Goal succeeded!')
         else:
             self.get_logger().info(f'Goal failed with status: {status}')
+
+        # Reset current goal
+        self.current_goal = None
 
         # After reaching the goal, look for the next frontier
         self.find_and_navigate_to_frontier()
@@ -155,12 +184,24 @@ class FrontierExplorer(Node):
         # Process feedback from the action server if needed
         pass
 
+    def goal_timeout_callback(self):
+        if self.current_goal is not None:
+            self.get_logger().warn('Goal timeout reached. Cancelling the current goal.')
+            self.navigator.cancel_goal_async(self.current_goal)
+            self.current_goal = None
+            self.exploring = False  # Reset exploring flag to allow retry
+            self.find_and_navigate_to_frontier()
+
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
-    rclpy.spin(explorer)
-    explorer.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(explorer)
+    except KeyboardInterrupt:
+        explorer.get_logger().info('Keyboard interrupt, shutting down.')
+    finally:
+        explorer.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
