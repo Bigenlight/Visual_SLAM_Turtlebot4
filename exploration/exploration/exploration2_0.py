@@ -15,7 +15,7 @@ class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
 
-        # Set logging level to DEBUG
+        # Set logging level to DEBUG for detailed logs
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
 
         # Subscription to the /map topic
@@ -30,9 +30,9 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 20.0  # Adjusted maximum exploration distance
-        self.min_frontier_distance = 0.25  # Adjusted minimum goal distance
-        self.safety_distance = 0.1  # Adjusted safety distance
+        self.max_frontier_distance = 20.0  # Maximum exploration distance in meters
+        self.min_frontier_distance = 0.36  # Minimum goal distance in meters (tolerance)
+        self.safety_distance = 0.1  # Safety distance in meters
         self.max_retries = 3  # Maximum number of goal retries
         self.retry_count = 0
         self.goal_timeout = 30.0  # Goal reach timeout in seconds
@@ -56,7 +56,15 @@ class FrontierExplorer(Node):
         self.navigator.wait_for_server()
         self.get_logger().info('NavigateToPose action server ready.')
 
+        # Initialize visited frontiers list
+        self.visited_frontiers = []
+        self.frontier_distance_threshold = 0.25  # 25 cm to consider a frontier as visited
+
     def map_callback(self, msg):
+        """
+        Callback function for the /map topic.
+        Updates the map data and initiates exploration if not already exploring.
+        """
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
         self.map_info = msg.info
 
@@ -65,6 +73,9 @@ class FrontierExplorer(Node):
             self.find_and_navigate_to_frontier()
 
     def find_and_navigate_to_frontier(self):
+        """
+        Detects frontiers, clusters them, selects a valid frontier, and sends a navigation goal.
+        """
         # Frontier detection logic
         frontiers = self.detect_frontiers()
 
@@ -76,6 +87,12 @@ class FrontierExplorer(Node):
 
         # Cluster the frontiers
         clustered_frontiers = self.cluster_frontiers(frontiers)
+
+        if not clustered_frontiers:
+            self.get_logger().info('No valid frontiers after clustering.')
+            self.exploring = False
+            self.stop_robot()
+            return
 
         # Select the closest valid frontier within min and max distance
         goal_position = self.select_frontier(clustered_frontiers)
@@ -106,7 +123,10 @@ class FrontierExplorer(Node):
         self.start_movement_monitoring()
 
     def detect_frontiers(self):
-        # Find free cells that are adjacent to unknown cells
+        """
+        Detects frontier points in the map.
+        A frontier is a free cell adjacent to at least two unknown cells.
+        """
         if self.map_data is None:
             return []
 
@@ -119,43 +139,58 @@ class FrontierExplorer(Node):
         for cell in free_cells:
             y, x = cell
             neighbors = self.get_neighbors(x, y)
+            unknown_neighbors = 0
             for nx, ny in neighbors:
                 if self.map_data[ny, nx] == -1:
-                    # This free cell is adjacent to an unknown cell; it's a frontier
-                    mx, my = self.grid_to_map(x, y)
-                    frontier_points.append([mx, my])
-                    break  # No need to check other neighbors
+                    unknown_neighbors += 1
+            if unknown_neighbors >= 2:  # Require at least two unknown neighbors
+                mx, my = self.grid_to_map(x, y)
+                frontier_points.append([mx, my])
 
         self.get_logger().info(f'Detected {len(frontier_points)} frontier points.')
         return frontier_points
 
     def cluster_frontiers(self, frontiers):
-        # Cluster the frontier points using DBSCAN
+        """
+        Clusters frontier points using DBSCAN and filters out small clusters.
+        Returns the centroids of valid clusters.
+        """
         if not frontiers:
             return []
 
-        clustering = DBSCAN(eps=0.5, min_samples=2).fit(frontiers)
+        clustering = DBSCAN(eps=0.5, min_samples=5).fit(frontiers)  # min_samples increased to filter small clusters
         labels = clustering.labels_
 
         unique_labels = set(labels)
         clustered_frontiers = []
 
+        min_cluster_size = 5  # Minimum number of points in a cluster
+
         for label in unique_labels:
             if label == -1:
-                # Noise points; you can choose to include or exclude them
+                # Noise points; exclude them
                 continue
             indices = np.where(labels == label)[0]
             cluster = np.array(frontiers)[indices]
+            cluster_size = len(cluster)
+
+            # Filter out clusters that are too small
+            if cluster_size < min_cluster_size:
+                self.get_logger().debug(f'Ignoring small cluster with label {label} of size {cluster_size}')
+                continue
+
             # Compute the centroid of the cluster
             centroid = np.mean(cluster, axis=0)
             point = Point(x=centroid[0], y=centroid[1], z=0.0)
             clustered_frontiers.append(point)
 
-        self.get_logger().info(f'Clustered into {len(clustered_frontiers)} frontiers.')
+        self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
         return clustered_frontiers
 
     def select_frontier(self, frontiers):
-        # Select the closest frontier within the specified distance range and ensure it's safe
+        """
+        Selects the closest valid frontier that hasn't been visited and is safe.
+        """
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
@@ -164,10 +199,16 @@ class FrontierExplorer(Node):
         valid_frontiers = []
         distances = []
         for frontier in frontiers:
+            # Check if this frontier has been visited
+            if self.is_frontier_visited(frontier):
+                self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) has already been visited.')
+                continue
+
             dx = frontier.x - robot_position.x
             dy = frontier.y - robot_position.y
             distance = math.hypot(dx, dy)
             self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
+
             if self.min_frontier_distance <= distance <= self.max_frontier_distance:
                 # Check if the goal is safe
                 is_safe = self.is_goal_safe(frontier.x, frontier.y, self.safety_distance)
@@ -178,18 +219,20 @@ class FrontierExplorer(Node):
                     self.get_logger().info(f'Valid frontier at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
             else:
                 self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) is out of distance range.')
+
         if not valid_frontiers:
             return None
 
         # Select the frontier with the minimum distance
         min_index = np.argmin(distances)
         selected_frontier = valid_frontiers[min_index]
+        self.visited_frontiers.append(selected_frontier)  # Add to visited frontiers
         self.get_logger().info(f'Selected frontier at ({selected_frontier.x:.2f}, {selected_frontier.y:.2f})')
         return selected_frontier
 
     def is_goal_safe(self, goal_x, goal_y, safety_distance=0.5):
         """
-        Check if the goal position is safe by ensuring there are no obstacles within the safety distance.
+        Checks if the goal position is safe by ensuring there are no obstacles within the safety distance.
         """
         if self.map_info is None or self.map_data is None:
             return False
@@ -218,7 +261,9 @@ class FrontierExplorer(Node):
         return True
 
     def get_neighbors(self, x, y):
-        # Get 8-connected neighbors
+        """
+        Returns the 8-connected neighbors of a given cell.
+        """
         neighbors = []
         width = self.map_data.shape[1]
         height = self.map_data.shape[0]
@@ -231,12 +276,17 @@ class FrontierExplorer(Node):
         return neighbors
 
     def grid_to_map(self, x, y):
-        # Convert grid coordinates to map coordinates
+        """
+        Converts grid coordinates to map coordinates.
+        """
         mx = self.map_info.origin.position.x + (x + 0.5) * self.map_info.resolution
         my = self.map_info.origin.position.y + (y + 0.5) * self.map_info.resolution
         return mx, my
 
     def get_robot_pose(self):
+        """
+        Retrieves the robot's current pose in the map frame.
+        """
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             self.get_logger().debug(f'Robot position: ({trans.transform.translation.x:.2f}, {trans.transform.translation.y:.2f})')
@@ -245,7 +295,22 @@ class FrontierExplorer(Node):
             self.get_logger().error(f'Could not get robot pose: {e}')
             return None
 
+    def is_frontier_visited(self, frontier):
+        """
+        Checks if a frontier has already been visited based on the distance threshold.
+        """
+        for visited in self.visited_frontiers:
+            dx = frontier.x - visited.x
+            dy = frontier.y - visited.y
+            distance = math.hypot(dx, dy)
+            if distance < self.frontier_distance_threshold:
+                return True
+        return False
+
     def goal_response_callback(self, future):
+        """
+        Callback for handling the response from the action server after sending a goal.
+        """
         try:
             goal_handle = future.result()
         except Exception as e:
@@ -271,6 +336,9 @@ class FrontierExplorer(Node):
         self.result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
+        """
+        Callback for handling the result from the action server after the goal is processed.
+        """
         try:
             result = future.result()
         except Exception as e:
@@ -293,6 +361,9 @@ class FrontierExplorer(Node):
         self.find_and_navigate_to_frontier()
 
     def handle_goal_failure(self):
+        """
+        Handles goal failure by retrying or stopping exploration after maximum retries.
+        """
         self.retry_count += 1
         if self.retry_count >= self.max_retries:
             self.get_logger().warn('Maximum retries reached. Stopping exploration.')
@@ -303,10 +374,16 @@ class FrontierExplorer(Node):
             self.find_and_navigate_to_frontier()
 
     def feedback_callback(self, feedback_msg):
-        # Optional: Process feedback from the action server
+        """
+        Callback for processing feedback from the action server.
+        Currently unused but can be implemented as needed.
+        """
         pass
 
     def goal_timeout_callback(self):
+        """
+        Callback for handling goal timeouts. Cancels the current goal if timeout is reached.
+        """
         if self.current_goal is not None:
             self.get_logger().warn('Goal timeout reached. Cancelling the current goal.')
             self.cancel_current_goal()
@@ -314,6 +391,9 @@ class FrontierExplorer(Node):
             self.find_and_navigate_to_frontier()
 
     def cancel_goal_response_callback(self, future):
+        """
+        Callback for handling the response from the action server after cancelling a goal.
+        """
         try:
             response = future.result()
             if len(response.goals_canceling) > 0:
@@ -324,7 +404,9 @@ class FrontierExplorer(Node):
             self.get_logger().error(f'Failed to cancel goal: {e}')
 
     def stop_robot(self):
-        # Publish zero velocities to stop the robot
+        """
+        Publishes zero velocities to stop the robot.
+        """
         stop_msg = Twist()
         stop_msg.linear.x = 0.0
         stop_msg.linear.y = 0.0
@@ -337,17 +419,26 @@ class FrontierExplorer(Node):
 
     # Movement monitoring methods
     def start_movement_monitoring(self):
+        """
+        Initializes movement monitoring by recording the current position and starting a timer.
+        """
         self.last_moving_position = self.get_robot_pose()
         self.last_moving_time = self.get_clock().now()
         self.movement_timer = self.create_timer(self.movement_check_interval, self.check_movement_callback)
         self.get_logger().debug('Started movement monitoring.')
 
     def stop_movement_monitoring(self):
+        """
+        Stops the movement monitoring timer.
+        """
         if hasattr(self, 'movement_timer'):
             self.movement_timer.cancel()
             self.get_logger().debug('Stopped movement monitoring.')
 
     def check_movement_callback(self):
+        """
+        Periodically checks if the robot has moved significantly. If not, considers the robot stuck.
+        """
         current_time = self.get_clock().now()
         current_position = self.get_robot_pose()
         if current_position is None or self.last_moving_position is None:
@@ -375,6 +466,9 @@ class FrontierExplorer(Node):
                 self.find_and_navigate_to_frontier()
 
     def cancel_current_goal(self):
+        """
+        Cancels the current navigation goal and resets exploration state.
+        """
         if self.current_goal is not None:
             try:
                 cancel_future = self.navigator.cancel_goal_async(self.current_goal)

@@ -145,10 +145,10 @@ local_costmap:
       robot_base_frame: base_link
       use_sim_time: true
       rolling_window: true
-      width: 3
-      height: 3
+      width: 2
+      height: 2
       resolution: 0.06
-      robot_radius: 0.175
+      robot_radius: 0.17
       plugins: ["static_layer", "voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
