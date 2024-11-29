@@ -11,7 +11,6 @@ import math
 import tf2_ros
 from rclpy.duration import Duration
 from skimage import measure
-from nav_msgs.srv import GetPlan
 from nav_msgs.msg import Path
 
 class BoustrophedonExplorer(Node):
@@ -33,12 +32,6 @@ class BoustrophedonExplorer(Node):
         self.get_logger().info('Waiting for navigate_to_pose action server...')
         self.navigator.wait_for_server()
         self.get_logger().info('Action server available.')
-
-        # Create a service client for path planning
-        self.get_plan_client = self.create_client(GetPlan, 'planner_server/get_plan')
-        while not self.get_plan_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for GetPlan service...')
-        self.get_logger().info('GetPlan service available.')
 
         # Parameters
         self.declare_parameter('safe_distance', 0.3)  # meters
@@ -143,11 +136,6 @@ class BoustrophedonExplorer(Node):
             goal_pose = self.create_pose_stamped(waypoint, next_position=next_waypoint)
             self.get_logger().info(f'Navigating to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f})')
 
-            # Check if the robot can plan to the waypoint
-            if not self.can_plan_to_goal(goal_pose):
-                self.get_logger().warning(f'Cannot plan to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f}), skipping.')
-                continue
-
             # Attempt to reach the waypoint with retries
             success = self.navigate_to_pose_with_retries(goal_pose, retries=3)
             if not success and self.recovery_behavior_enabled:
@@ -161,8 +149,15 @@ class BoustrophedonExplorer(Node):
             send_goal_future = self.navigator.send_goal_async(NavigateToPose.Goal(pose=goal_pose), feedback_callback=self.feedback_callback)
             send_goal_future.add_done_callback(self.goal_response_callback)
 
+            # Wait for the goal response
+            rclpy.spin_until_future_complete(self, send_goal_future)
+            goal_handle = send_goal_future.result()
+            if not goal_handle.accepted:
+                self.get_logger().warning('Goal rejected by the action server.')
+                continue
+
             # Wait for the result with a timeout
-            result_future = self.result_future
+            result_future = goal_handle.get_result_async()
             try:
                 rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
                 status = result_future.result().status
@@ -198,37 +193,6 @@ class BoustrophedonExplorer(Node):
         twist.angular.z = 0.0
         cmd_vel_pub.publish(twist)
         self.get_logger().info('Recovery behavior completed.')
-
-    def can_plan_to_goal(self, goal_pose):
-        # Use the GetPlan service to check if a path exists to the goal
-        robot_pose = self.get_robot_pose()
-        if robot_pose is None:
-            self.get_logger().warning('Cannot get robot pose.')
-            return False
-
-        start_pose = PoseStamped()
-        start_pose.header.frame_id = 'map'
-        start_pose.header.stamp = self.get_clock().now().to_msg()
-        start_pose.pose.position = robot_pose
-        start_pose.pose.orientation.w = 1.0
-
-        req = GetPlan.Request()
-        req.start = start_pose
-        req.goal = goal_pose
-        req.tolerance = 0.5  # meters
-
-        future = self.get_plan_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-
-        if future.result() is not None:
-            path = future.result().plan
-            if len(path.poses) > 0:
-                return True
-            else:
-                return False
-        else:
-            self.get_logger().warning('Failed to call GetPlan service.')
-            return False
 
     def create_pose_stamped(self, position, next_position=None):
         pose = PoseStamped()
@@ -274,18 +238,8 @@ class BoustrophedonExplorer(Node):
             return None
 
     def goal_response_callback(self, future):
-        try:
-            goal_handle = future.result()
-            if not goal_handle.accepted:
-                self.get_logger().info('Goal rejected :(')
-                self.result_future = None
-                return
-
-            self.get_logger().info('Goal accepted :)')
-            self.result_future = goal_handle.get_result_async()
-        except Exception as e:
-            self.get_logger().error(f'Exception in goal_response_callback: {e}')
-            self.result_future = None
+        # Goal response is handled in navigate_to_pose_with_retries
+        pass
 
     def feedback_callback(self, feedback_msg):
         # Optionally process feedback here
