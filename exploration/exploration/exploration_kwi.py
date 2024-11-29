@@ -29,6 +29,7 @@ class FrontierExplorer(Node):
         self.exploring = False
         self.max_frontier_distance = 2.0  # 최대 탐사 거리 (미터 단위)
         self.min_frontier_distance = 0.5  # 최소 목표 거리 (미터 단위)
+        self.safety_distance = 0.5  # 안전 거리 (미터 단위)
         self.max_retries = 3  # 목표 재시도 횟수
         self.retry_count = 0
         self.goal_timeout = 15.0  # 목표 도달 타임아웃 (초 단위)
@@ -67,7 +68,7 @@ class FrontierExplorer(Node):
         goal_position = self.select_frontier(frontiers)
 
         if goal_position is None:
-            self.get_logger().info('No reachable frontiers found within the specified distance range.')
+            self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
             self.exploring = False
             self.stop_robot()
             return
@@ -104,21 +105,21 @@ class FrontierExplorer(Node):
             neighbors = self.get_neighbors(x, y)
             for nx, ny in neighbors:
                 if self.map_data[ny, nx] == 0:
-                    # Convert grid to map coordinates
+                    # Convert grid coordinates to map coordinates
                     mx, my = self.grid_to_map(x, y)
                     frontiers.append(Point(x=mx, y=my, z=0.0))
                     break  # No need to check other neighbors
 
+        self.get_logger().info(f'Detected {len(frontiers)} frontiers.')
         return frontiers
 
     def select_frontier(self, frontiers):
-        # Select the closest frontier within the specified distance range
+        # Select the closest frontier within the specified distance range and ensure it's safe
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
             return frontiers[0] if frontiers else None
 
-        # Compute distances and filter frontiers
         valid_frontiers = []
         distances = []
         for frontier in frontiers:
@@ -126,15 +127,52 @@ class FrontierExplorer(Node):
             dy = frontier.y - robot_position.y
             distance = math.hypot(dx, dy)
             if self.min_frontier_distance <= distance <= self.max_frontier_distance:
-                valid_frontiers.append(frontier)
-                distances.append(distance)
+                # Check if the goal is safe
+                if self.is_goal_safe(frontier.x, frontier.y, self.safety_distance):
+                    valid_frontiers.append(frontier)
+                    distances.append(distance)
+                    self.get_logger().info(f'Valid frontier found at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
 
         if not valid_frontiers:
             return None
 
         # Select the frontier with the minimum distance
         min_index = np.argmin(distances)
-        return valid_frontiers[min_index]
+        selected_frontier = valid_frontiers[min_index]
+        self.get_logger().info(f'Selected frontier at ({selected_frontier.x:.2f}, {selected_frontier.y:.2f})')
+        return selected_frontier
+
+    def is_goal_safe(self, goal_x, goal_y, safety_distance=0.5):
+        """
+        Check if the goal position is safe by ensuring there are no obstacles within the safety distance.
+        
+        :param goal_x: Goal x position in meters
+        :param goal_y: Goal y position in meters
+        :param safety_distance: Safety distance in meters
+        :return: True if safe, False otherwise
+        """
+        if self.map_info is None or self.map_data is None:
+            return False
+
+        # Calculate the number of cells corresponding to the safety distance
+        num_cells = int(math.ceil(safety_distance / self.map_info.resolution))
+
+        # Convert goal position to grid coordinates
+        goal_grid_x = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
+        goal_grid_y = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
+
+        # Define the grid range to check
+        min_x = max(goal_grid_x - num_cells, 0)
+        max_x = min(goal_grid_x + num_cells, self.map_data.shape[1] - 1)
+        min_y = max(goal_grid_y - num_cells, 0)
+        max_y = min(goal_grid_y + num_cells, self.map_data.shape[0] - 1)
+
+        # Check each cell within the safety distance
+        for y in range(min_y, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                if self.map_data[y, x] > 50:  # Threshold for obstacle, adjust as needed
+                    return False
+        return True
 
     def get_neighbors(self, x, y):
         # Get 8-connected neighbors
@@ -236,11 +274,11 @@ class FrontierExplorer(Node):
                 else:
                     self.get_logger().error('Neither cancel_goal_async nor _cancel_goal_async methods are available.')
                     return
-                
+
                 cancel_future.add_done_callback(self.cancel_goal_response_callback)
             except AttributeError as e:
                 self.get_logger().error(f'Failed to cancel goal: {e}')
-            
+
             # Reset variables
             self.current_goal = None
             self.exploring = False  # Allow retry
