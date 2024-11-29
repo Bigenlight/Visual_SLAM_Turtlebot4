@@ -55,10 +55,10 @@ class FrontierExplorer(Node):
         self.declare_parameter('stuck_timeout', 4.0)  # 4초 동안 움직이지 않으면 스턱으로 간주
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
-        self.declare_parameter('waypoint_spacing', 0.3)  # 웨이포인트 간격을 0.3미터로 설정
+        self.declare_parameter('waypoint_spacing', 0.5)  # 웨이포인트 간격을 0.3미터로 설정
         self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
 
-        self.declare_parameter('robot_width', 0.35)
+        self.declare_parameter('robot_width', 0.3)
         self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
 
         self.declare_parameter('map_save_directory', '/tmp/maps')  # 맵 저장 디렉토리
@@ -482,7 +482,7 @@ class FrontierExplorer(Node):
 
         self.last_pose = current_pose
 
-    def split_waypoint(self, current_pos, target_pos, step=0.3):
+    def split_waypoint(self, current_pos, target_pos, step=0.5):
         """
         목표 웨이포인트를 현재 위치로부터 step 간격으로 분할하여 여러 개의 웨이포인트 리스트를 반환합니다.
         """
