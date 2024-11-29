@@ -17,7 +17,6 @@ import os
 import json
 import datetime
 
-
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -170,8 +169,9 @@ class FrontierExplorer(Node):
         waypoints = []
         for center in cluster_centers:
             if self.is_safe_point(center[0], center[1]):
-                waypoint = Point(x=center[0], y=center[1], z=0.0)
-                waypoints.append(waypoint)
+                # 벽과 벽 중앙에 웨이포인트를 위치시키기 위한 조정
+                adjusted_waypoint = self.adjust_waypoint_position(center)
+                waypoints.append(adjusted_waypoint)
             else:
                 self.get_logger().debug(f'Waypoint at ({center[0]:.2f}, {center[1]:.2f}) is not safe.')
 
@@ -180,6 +180,17 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'Generated {len(waypoints)} waypoints for exploration.')
         return waypoints
+
+    def adjust_waypoint_position(self, center):
+        """
+        웨이포인트를 벽과 벽 중앙에 위치시키기 위해 조정합니다.
+        현재는 간단하게 벽 중앙을 목표로 삼습니다.
+        필요에 따라 추가적인 로직을 구현할 수 있습니다.
+        """
+        # 현재 로직에서는 별도의 조정 없이 중앙에 위치하도록 유지
+        # 추가적인 조정이 필요한 경우 여기서 구현
+        waypoint = Point(x=center[0], y=center[1], z=0.0)
+        return waypoint
 
     def is_safe_point(self, x_world, y_world):
         # 월드 좌표를 맵 인덱스로 변환
@@ -280,7 +291,7 @@ class FrontierExplorer(Node):
         # 현재 목표가 활성화되어 있다면 취소
         if self.goal_handle is not None:
             self.get_logger().info('Cancelling current goal due to being stuck.')
-            cancel_future = self.navigator.cancel_goal_async(self.goal_handle)
+            cancel_future = self.goal_handle.cancel_goal_async()  # 수정된 부분
             cancel_future.add_done_callback(self.cancel_goal_callback)
         else:
             # 목표가 없다면 회전 후 다음 웨이포인트 시도
@@ -441,7 +452,6 @@ class FrontierExplorer(Node):
 
         self.last_pose = current_pose
 
-
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
@@ -453,7 +463,6 @@ def main(args=None):
         explorer.get_logger().error(f'Exception in main: {e}')
     finally:
         explorer.shutdown_node()
-
 
 if __name__ == '__main__':
     main()
