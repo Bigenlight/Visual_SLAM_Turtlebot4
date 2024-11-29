@@ -42,7 +42,7 @@ class FrontierExplorer(Node):
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
         self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 5.0  # 5 seconds without movement
+        self.movement_timeout = 3.0  # 3 seconds without movement
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -59,6 +59,13 @@ class FrontierExplorer(Node):
         # Initialize visited frontiers list
         self.visited_frontiers = []
         self.frontier_distance_threshold = 0.25  # 25 cm to consider a frontier as visited
+
+        # Initialize map closure monitoring
+        self.last_frontier_time = self.get_clock().now()  # Initialize with current time
+        self.map_closed_duration = 10.0  # Duration in seconds to consider the map as closed
+
+        # Create a timer to periodically check for map closure
+        self.map_closed_timer = self.create_timer(1.0, self.check_map_closed_callback)
 
     def map_callback(self, msg):
         """
@@ -79,48 +86,51 @@ class FrontierExplorer(Node):
         # Frontier detection logic
         frontiers = self.detect_frontiers()
 
+        if frontiers:
+            # Update the last frontier detection time
+            self.last_frontier_time = self.get_clock().now()
+            self.get_logger().debug(f'Frontiers detected at {self.last_frontier_time.to_sec()}.')
+
         if not frontiers:
-            self.get_logger().info('Exploration complete!')
-            self.exploring = False
-            self.stop_robot()
-            return
+            self.get_logger().info('No frontiers detected. Exploration may be complete.')
+            # Exploration may be complete; however, we wait for the map closure timer to confirm
+        else:
+            # Cluster the frontiers
+            clustered_frontiers = self.cluster_frontiers(frontiers)
 
-        # Cluster the frontiers
-        clustered_frontiers = self.cluster_frontiers(frontiers)
+            if not clustered_frontiers:
+                self.get_logger().info('No valid frontiers after clustering.')
+                self.exploring = False
+                self.stop_robot()
+                return
 
-        if not clustered_frontiers:
-            self.get_logger().info('No valid frontiers after clustering.')
-            self.exploring = False
-            self.stop_robot()
-            return
+            # Select the closest valid frontier within min and max distance
+            goal_position = self.select_frontier(clustered_frontiers)
 
-        # Select the closest valid frontier within min and max distance
-        goal_position = self.select_frontier(clustered_frontiers)
+            if goal_position is None:
+                self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
+                self.exploring = False
+                self.stop_robot()
+                return
 
-        if goal_position is None:
-            self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
-            self.exploring = False
-            self.stop_robot()
-            return
+            # Create and send a navigation goal
+            goal_msg = NavigateToPose.Goal()
+            goal_msg.pose = PoseStamped()
+            goal_msg.pose.header.frame_id = 'map'
+            goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+            goal_msg.pose.pose.position = goal_position
+            goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
 
-        # Create and send a navigation goal
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = PoseStamped()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.pose.pose.position = goal_position
-        goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
+            self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
 
-        self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
+            send_goal_future = self.navigator.send_goal_async(
+                goal_msg,
+                feedback_callback=self.feedback_callback
+            )
+            send_goal_future.add_done_callback(self.goal_response_callback)
 
-        send_goal_future = self.navigator.send_goal_async(
-            goal_msg,
-            feedback_callback=self.feedback_callback
-        )
-        send_goal_future.add_done_callback(self.goal_response_callback)
-
-        # Start the movement monitoring timer
-        self.start_movement_monitoring()
+            # Start the movement monitoring timer
+            self.start_movement_monitoring()
 
     def detect_frontiers(self):
         """
@@ -483,6 +493,30 @@ class FrontierExplorer(Node):
             self.last_moving_position = None
             self.last_moving_time = None
 
+    def check_map_closed_callback(self):
+        """
+        Periodically checks if no new frontiers have been detected for the specified duration.
+        If so, it logs a message and shuts down the node.
+        """
+        current_time = self.get_clock().now()
+        time_since_last_frontier = (current_time - self.last_frontier_time).nanoseconds / 1e9  # Convert to seconds
+
+        if time_since_last_frontier >= self.map_closed_duration:
+            self.get_logger().info('The map is closed! Shutting down the explorer node.')
+            self.stop_robot()
+            rclpy.shutdown()
+
+    def cancel_all_timers(self):
+        """
+        Cancels all active timers to ensure clean shutdown.
+        """
+        if hasattr(self, 'map_closed_timer'):
+            self.map_closed_timer.cancel()
+        if hasattr(self, 'movement_timer'):
+            self.movement_timer.cancel()
+        if hasattr(self, 'goal_timer'):
+            self.goal_timer.cancel()
+
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
@@ -491,6 +525,7 @@ def main(args=None):
     except KeyboardInterrupt:
         explorer.get_logger().info('Keyboard interrupt, shutting down.')
     finally:
+        explorer.cancel_all_timers()
         explorer.destroy_node()
         rclpy.shutdown()
 
