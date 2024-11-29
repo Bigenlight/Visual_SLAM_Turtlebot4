@@ -46,7 +46,7 @@ class BoustrophedonExplorer(Node):
         self.get_logger().info('Action server available.')
 
         # 파라미터 선언
-        self.declare_parameter('safe_distance', 0.5)  # 미터 단위
+        self.declare_parameter('safe_distance', 0.7)  # 안전 거리 증가
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
@@ -143,11 +143,15 @@ class BoustrophedonExplorer(Node):
             self.get_logger().warning('No valid points found in frontier.')
             return []
 
+        # Distance Transform 값에 기반하여 우선순위 설정
+        valid_distances = distance_transform[valid_points]
+        sorted_indices = indices[np.argsort(-valid_distances)]
+
         # 좌표 변환 (x, y)
-        points = indices[:, [1, 0]].astype(float)  # x, y 순서로 변경
+        points = sorted_indices[:, [1, 0]].astype(float)  # x, y 순서로 변경
         points = points * self.map_info.resolution + np.array([self.map_info.origin.position.x, self.map_info.origin.position.y])
 
-        # DBSCAN 클러스터링 적용
+        # 클러스터링 적용
         clustering = DBSCAN(eps=self.waypoint_spacing, min_samples=1).fit(points)
         cluster_centers = []
         for cluster_label in np.unique(clustering.labels_):
@@ -223,6 +227,10 @@ class BoustrophedonExplorer(Node):
         if last_position is None:
             self.get_logger().warning('Cannot get initial robot position. Proceeding without movement check.')
 
+        # 이동하지 않은 시간 측정을 위한 변수 초기화
+        time_not_moved = 0.0
+        last_movement_time = self.get_clock().now()
+
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=1.0)
             status = goal_handle.status
@@ -240,7 +248,7 @@ class BoustrophedonExplorer(Node):
                 goal_handle.cancel_goal_async()
                 return False
 
-            # 로봇의 이동 거리 확인 (움직임이 없으면 멈춘 것으로 간주)
+            # 로봇의 이동 거리 확인
             current_position = self.get_robot_pose()
             if current_position is not None and last_position is not None:
                 distance_moved = math.hypot(
@@ -248,11 +256,15 @@ class BoustrophedonExplorer(Node):
                     current_position.y - last_position.y
                 )
                 if distance_moved < 0.01:  # 1cm 미만 이동 시
-                    self.get_logger().warning('Robot seems to be stuck. Cancelling goal.')
-                    goal_handle.cancel_goal_async()
-                    return False
+                    time_not_moved = (current_time - last_movement_time).nanoseconds / 1e9
+                    if time_not_moved >= 1.5:
+                        self.get_logger().warning('Robot has not moved for 1.5 seconds. Cancelling goal.')
+                        goal_handle.cancel_goal_async()
+                        return False
                 else:
                     last_position = current_position
+                    last_movement_time = current_time
+                    time_not_moved = 0.0
 
         return False
 
@@ -333,4 +345,37 @@ class BoustrophedonExplorer(Node):
                 tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
             self.get_logger().error(f'Could not get robot pose: {e}')
-          
+            return None
+
+    def get_robot_orientation(self):
+        try:
+            now = rclpy.time.Time()
+            trans = self.tf_buffer.lookup_transform(
+                'map',
+                'base_link',
+                rclpy.time.Time(),
+                timeout=Duration(seconds=1.0))
+            return trans.transform.rotation
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+
+    def feedback_callback(self, feedback_msg):
+        # 피드백 처리 가능 (현재는 생략)
+        pass
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    explorer = BoustrophedonExplorer()
+    try:
+        rclpy.spin(explorer)
+    except KeyboardInterrupt:
+        pass
+    explorer.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
