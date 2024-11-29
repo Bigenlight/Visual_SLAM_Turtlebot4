@@ -6,8 +6,7 @@ from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 import numpy as np
-from tf2_ros import Buffer, TransformListener
-import tf2_geometry_msgs
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 from geometry_msgs.msg import TransformStamped
 from rclpy.duration import Duration
 import math
@@ -15,9 +14,15 @@ import math
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
+
+        # Subscription to the /map topic
         self.map_subscriber = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10)
+
+        # ActionClient for NavigateToPose
         self.navigator = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # Initialize variables
         self.map_data = None
         self.map_info = None
         self.current_goal = None
@@ -26,12 +31,12 @@ class FrontierExplorer(Node):
         self.min_frontier_distance = 0.5  # 최소 목표 거리 (미터 단위)
         self.max_retries = 3  # 목표 재시도 횟수
         self.retry_count = 0
-        self.goal_timeout = 5.0  # 목표 도달 타임아웃 (초 단위)
+        self.goal_timeout = 15.0  # 목표 도달 타임아웃 (초 단위)
 
-        # 퍼블리셔 추가: cmd_vel 토픽에 정지 명령을 보내기 위해
+        # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
-        # Set up TF listener to get robot's current pose
+        # TF2 Buffer and Listener
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -84,22 +89,22 @@ class FrontierExplorer(Node):
         send_goal_future.add_done_callback(self.goal_response_callback)
 
         # Start a timer for goal timeout
-        self.create_timer(self.goal_timeout, self.goal_timeout_callback, callback_group=None)
+        self.goal_timer = self.create_timer(self.goal_timeout, self.goal_timeout_callback, callback_group=None)
 
     def detect_frontiers(self):
-        # Implement frontier detection logic
-        # Return a list of Point objects representing frontiers
+        # Frontier detection logic: find unknown cells adjacent to free cells
+        if self.map_data is None:
+            return []
 
         unknown = np.argwhere(self.map_data == -1)
         frontiers = []
 
-        # For each unknown cell, check if it is adjacent to a free cell
         for cell in unknown:
             y, x = cell
             neighbors = self.get_neighbors(x, y)
             for nx, ny in neighbors:
                 if self.map_data[ny, nx] == 0:
-                    # This is a frontier cell
+                    # Convert grid to map coordinates
                     mx, my = self.grid_to_map(x, y)
                     frontiers.append(Point(x=mx, y=my, z=0.0))
                     break  # No need to check other neighbors
@@ -107,14 +112,13 @@ class FrontierExplorer(Node):
         return frontiers
 
     def select_frontier(self, frontiers):
-        # Select the closest reachable frontier within min and max frontier distance
-
+        # Select the closest frontier within the specified distance range
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
             return frontiers[0] if frontiers else None
 
-        # Compute distances and filter frontiers within min and max distance
+        # Compute distances and filter frontiers
         valid_frontiers = []
         distances = []
         for frontier in frontiers:
@@ -133,7 +137,7 @@ class FrontierExplorer(Node):
         return valid_frontiers[min_index]
 
     def get_neighbors(self, x, y):
-        # Get valid neighboring cells (8-connected grid for better frontier detection)
+        # Get 8-connected neighbors
         neighbors = []
         width = self.map_data.shape[1]
         height = self.map_data.shape[0]
@@ -157,12 +161,19 @@ class FrontierExplorer(Node):
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             return trans.transform.translation
-        except Exception as e:
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
             self.get_logger().error(f'Could not get robot pose: {e}')
             return None
 
     def goal_response_callback(self, future):
-        goal_handle = future.result()
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self.get_logger().error(f'Goal failed to reach server: {e}')
+            self.exploring = False
+            self.stop_robot()
+            return
+
         if not goal_handle.accepted:
             self.get_logger().info('Goal rejected :(')
             self.exploring = False
@@ -171,44 +182,82 @@ class FrontierExplorer(Node):
 
         self.get_logger().info('Goal accepted :)')
         self.current_goal = goal_handle
+
+        # Cancel the goal timer since the goal was accepted
+        if hasattr(self, 'goal_timer'):
+            self.goal_timer.cancel()
+
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        result = future.result()
+        try:
+            result = future.result()
+        except Exception as e:
+            self.get_logger().error(f'Failed to get result: {e}')
+            self.handle_goal_failure()
+            return
+
         status = result.status
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Goal succeeded!')
             self.retry_count = 0  # Reset retry count on success
         else:
             self.get_logger().info(f'Goal failed with status: {status}')
-            self.retry_count += 1
-            if self.retry_count >= self.max_retries:
-                self.get_logger().warn('Maximum retries reached. Stopping exploration.')
-                self.exploring = False
-                self.stop_robot()
-                return
-            else:
-                self.get_logger().info('Retrying with a new frontier.')
+            self.handle_goal_failure()
 
-        # After reaching the goal or failing, look for the next frontier
+        # Look for the next frontier
         self.find_and_navigate_to_frontier()
 
+    def handle_goal_failure(self):
+        self.retry_count += 1
+        if self.retry_count >= self.max_retries:
+            self.get_logger().warn('Maximum retries reached. Stopping exploration.')
+            self.exploring = False
+            self.stop_robot()
+        else:
+            self.get_logger().info('Retrying with a new frontier.')
+
     def feedback_callback(self, feedback_msg):
-        # Process feedback from the action server if needed
+        # Optional: Process feedback from the action server
         pass
 
     def goal_timeout_callback(self):
         if self.current_goal is not None:
             self.get_logger().warn('Goal timeout reached. Cancelling the current goal.')
-            self.navigator.async_cancel_goal(self.current_goal)  # 수정된 메서드 호출
+            try:
+                if hasattr(self.navigator, 'cancel_goal_async'):
+                    # 공식 메서드가 존재할 경우 사용
+                    cancel_future = self.navigator.cancel_goal_async(self.current_goal)
+                elif hasattr(self.navigator, '_cancel_goal_async'):
+                    # 공식 메서드가 없고, private 메서드가 존재할 경우 사용
+                    self.get_logger().warn('Using _cancel_goal_async as cancel_goal_async is not available.')
+                    cancel_future = self.navigator._cancel_goal_async(self.current_goal)
+                else:
+                    self.get_logger().error('Neither cancel_goal_async nor _cancel_goal_async methods are available.')
+                    return
+                
+                cancel_future.add_done_callback(self.cancel_goal_response_callback)
+            except AttributeError as e:
+                self.get_logger().error(f'Failed to cancel goal: {e}')
+            
+            # Reset variables
             self.current_goal = None
-            self.exploring = False  # Reset exploring flag to allow retry
+            self.exploring = False  # Allow retry
             self.stop_robot()
-            self.find_and_navigate_to_frontier()
+
+    def cancel_goal_response_callback(self, future):
+        try:
+            response = future.result()
+            if len(response.goals_canceling) > 0:
+                self.get_logger().info('Goal successfully cancelled.')
+            else:
+                self.get_logger().info('No goals were cancelled.')
+        except Exception as e:
+            self.get_logger().error(f'Failed to cancel goal: {e}')
 
     def stop_robot(self):
-        # Send zero velocity to stop the robot
+        # Publish zero velocities to stop the robot
         stop_msg = Twist()
         stop_msg.linear.x = 0.0
         stop_msg.linear.y = 0.0
