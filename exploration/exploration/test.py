@@ -17,6 +17,7 @@ import os
 import json
 import datetime
 
+
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -52,10 +53,10 @@ class FrontierExplorer(Node):
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
-        self.declare_parameter('stuck_timeout', 30.0)
+        self.declare_parameter('stuck_timeout', 4.0)  # 4초 동안 움직이지 않으면 스턱으로 간주
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
-        self.declare_parameter('waypoint_spacing', 0.5)
+        self.declare_parameter('waypoint_spacing', 0.3)  # 웨이포인트 간격을 0.3미터로 설정
         self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
 
         self.declare_parameter('robot_width', 0.35)
@@ -73,6 +74,15 @@ class FrontierExplorer(Node):
 
         # 현재 목표 상태 추적
         self.current_goal_active = False
+
+        # 로봇의 마지막 위치 및 시간 추적
+        self.last_pose = None
+        self.last_movement_time = self.get_clock().now()
+        self.movement_threshold = 0.1  # 미터 단위
+        self.stuck = False
+
+        # 로봇 이동 모니터링을 위한 타이머 설정 (1초 간격)
+        self.timer = self.create_timer(1.0, self.monitor_robot_movement)
 
     def map_callback(self, msg):
         # OccupancyGrid 데이터를 NumPy 배열로 변환
@@ -267,8 +277,27 @@ class FrontierExplorer(Node):
 
     def perform_recovery_behavior(self):
         self.get_logger().info('Performing recovery behavior.')
-        self.rotate_in_place()
-        self.get_logger().info('Recovery behavior completed.')
+        # 현재 목표가 활성화되어 있다면 취소
+        if self.goal_handle is not None:
+            self.get_logger().info('Cancelling current goal due to being stuck.')
+            cancel_future = self.navigator.cancel_goal_async(self.goal_handle)
+            cancel_future.add_done_callback(self.cancel_goal_callback)
+        else:
+            # 목표가 없다면 회전 후 다음 웨이포인트 시도
+            self.rotate_in_place()
+            self.get_logger().info('Recovery behavior completed.')
+            self.send_next_waypoint()
+
+    def cancel_goal_callback(self, future):
+        cancel_response = future.result()
+        if len(cancel_response.goals_canceling) > 0:
+            self.get_logger().info('Current goal successfully canceled.')
+        else:
+            self.get_logger().warning('Failed to cancel current goal.')
+
+        self.goal_handle = None
+        self.current_goal_active = False
+        self.send_next_waypoint()
 
     def rotate_in_place(self):
         # 제자리에서 회전하여 장애물 회피 시도
@@ -276,12 +305,16 @@ class FrontierExplorer(Node):
         twist.angular.z = 0.5  # 시계방향으로 0.5 rad/s 회전
         duration = 5.0  # 5초 동안 회전
         start_time = self.get_clock().now()
+        self.get_logger().info('Rotating in place for recovery.')
+
         while (self.get_clock().now() - start_time).nanoseconds < duration * 1e9:
             self.cmd_vel_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.1)
+
         # 회전 정지
         twist.angular.z = 0.0
         self.cmd_vel_pub.publish(twist)
+        self.get_logger().info('Rotation complete.')
 
     def create_pose_stamped(self, position):
         pose = PoseStamped()
@@ -383,6 +416,32 @@ class FrontierExplorer(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to save map to file: {e}')
 
+    def monitor_robot_movement(self):
+        current_pose = self.get_robot_pose()
+        if current_pose is None:
+            return
+
+        if self.last_pose is not None:
+            dx = current_pose.x - self.last_pose.x
+            dy = current_pose.y - self.last_pose.y
+            distance = math.sqrt(dx**2 + dy**2)
+            if distance >= self.movement_threshold:
+                self.last_movement_time = self.get_clock().now()
+                self.stuck = False
+            else:
+                elapsed = (self.get_clock().now() - self.last_movement_time).nanoseconds / 1e9
+                if elapsed >= self.stuck_timeout and not self.stuck:
+                    self.get_logger().warning('Robot is stuck. Initiating recovery behavior.')
+                    self.stuck = True
+                    self.perform_recovery_behavior()
+        else:
+            # Initialize last_pose
+            self.last_pose = current_pose
+            self.last_movement_time = self.get_clock().now()
+
+        self.last_pose = current_pose
+
+
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
@@ -394,6 +453,7 @@ def main(args=None):
         explorer.get_logger().error(f'Exception in main: {e}')
     finally:
         explorer.shutdown_node()
+
 
 if __name__ == '__main__':
     main()
