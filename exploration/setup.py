@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
             'exploration_node = exploration.exploration:main',
             'exploration_kwi = exploration.exploration_kwi:main',
+            'test_node = exploration.test:main',
         ],
     },
 )
