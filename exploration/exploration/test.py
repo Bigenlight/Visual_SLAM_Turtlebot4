@@ -33,13 +33,13 @@ class BoustrophedonExplorer(Node):
         self.get_logger().info('Action server available.')
 
         # Parameters
-        self.declare_parameter('safe_distance', 0.3)  # meters
+        self.declare_parameter('safe_distance', 0.2)  # meters
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
-        self.declare_parameter('stuck_timeout', 10.0)  # seconds
+        self.declare_parameter('stuck_timeout', 3.0)  # seconds
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
