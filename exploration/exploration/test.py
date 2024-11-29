@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped, Point, Quaternion
+from geometry_msgs.msg import PoseStamped, Point, Quaternion, Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
@@ -11,7 +11,6 @@ import math
 import tf2_ros
 from rclpy.duration import Duration
 from skimage import measure
-from nav_msgs.msg import Path
 
 class BoustrophedonExplorer(Node):
     def __init__(self):
@@ -39,6 +38,11 @@ class BoustrophedonExplorer(Node):
 
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
+
+        self.declare_parameter('stuck_timeout', 10.0)  # seconds
+        self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
+
+        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
     def map_callback(self, msg):
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -136,63 +140,76 @@ class BoustrophedonExplorer(Node):
             goal_pose = self.create_pose_stamped(waypoint, next_position=next_waypoint)
             self.get_logger().info(f'Navigating to waypoint at ({waypoint.x:.2f}, {waypoint.y:.2f})')
 
-            # Attempt to reach the waypoint with retries
-            success = self.navigate_to_pose_with_retries(goal_pose, retries=3)
+            # Attempt to reach the waypoint with timeout
+            success = self.navigate_to_pose_with_timeout(goal_pose, timeout=self.stuck_timeout)
             if not success and self.recovery_behavior_enabled:
                 self.perform_recovery_behavior()
 
-    def navigate_to_pose_with_retries(self, goal_pose, retries=3):
-        attempt = 0
-        while attempt < retries:
-            attempt += 1
-            self.get_logger().info(f'Attempt {attempt} to navigate to waypoint.')
-            send_goal_future = self.navigator.send_goal_async(NavigateToPose.Goal(pose=goal_pose), feedback_callback=self.feedback_callback)
-            send_goal_future.add_done_callback(self.goal_response_callback)
+    def navigate_to_pose_with_timeout(self, goal_pose, timeout=60.0):
+        self.get_logger().info('Sending goal to the action server.')
+        send_goal_future = self.navigator.send_goal_async(NavigateToPose.Goal(pose=goal_pose), feedback_callback=self.feedback_callback)
+        rclpy.spin_until_future_complete(self, send_goal_future)
+        goal_handle = send_goal_future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warning('Goal rejected by the action server.')
+            return False
 
-            # Wait for the goal response
-            rclpy.spin_until_future_complete(self, send_goal_future)
-            goal_handle = send_goal_future.result()
-            if not goal_handle.accepted:
-                self.get_logger().warning('Goal rejected by the action server.')
-                continue
-
-            # Wait for the result with a timeout
+        self.get_logger().info('Goal accepted. Monitoring progress...')
+        start_time = self.get_clock().now()
+        last_position = self.get_robot_pose()
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=1.0)
             result_future = goal_handle.get_result_async()
-            try:
-                rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
+            if result_future.done():
                 status = result_future.result().status
                 if status == GoalStatus.STATUS_SUCCEEDED:
                     self.get_logger().info('Waypoint reached!')
                     return True
                 else:
                     self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
-            except Exception as e:
-                self.get_logger().error(f'Exception while waiting for goal result: {e}')
+                    return False
 
-        self.get_logger().error('Failed to reach waypoint after multiple attempts.')
+            # Check for stuck condition
+            current_time = self.get_clock().now()
+            if (current_time - start_time).nanoseconds > timeout * 1e9:
+                self.get_logger().warning('Timeout reached while navigating to waypoint.')
+                goal_handle.cancel_goal_async()
+                return False
+
+            current_position = self.get_robot_pose()
+            if current_position is not None and last_position is not None:
+                distance_moved = math.hypot(
+                    current_position.x - last_position.x,
+                    current_position.y - last_position.y
+                )
+                if distance_moved < 0.01:
+                    self.get_logger().warning('Robot seems to be stuck.')
+                    goal_handle.cancel_goal_async()
+                    return False
+                else:
+                    last_position = current_position
+
         return False
 
     def perform_recovery_behavior(self):
         self.get_logger().info('Performing recovery behavior.')
         # Example recovery behavior: rotate in place
         self.rotate_in_place()
+        # After recovery, attempt to move to the next waypoint
+        self.get_logger().info('Recovery behavior completed.')
 
     def rotate_in_place(self):
-        # Implement rotation in place
-        # This is a simple example using a Twist publisher
-        from geometry_msgs.msg import Twist
-        cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        # Rotate in place to get out of stuck situation
         twist = Twist()
         twist.angular.z = 0.5  # Rotate at 0.5 rad/s
         duration = 5.0  # Rotate for 5 seconds
         start_time = self.get_clock().now()
         while (self.get_clock().now() - start_time).nanoseconds < duration * 1e9:
-            cmd_vel_pub.publish(twist)
+            self.cmd_vel_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.1)
         # Stop rotation
         twist.angular.z = 0.0
-        cmd_vel_pub.publish(twist)
-        self.get_logger().info('Recovery behavior completed.')
+        self.cmd_vel_pub.publish(twist)
 
     def create_pose_stamped(self, position, next_position=None):
         pose = PoseStamped()
@@ -236,10 +253,6 @@ class BoustrophedonExplorer(Node):
                 tf2_ros.ExtrapolationException) as e:
             self.get_logger().error(f'Could not get robot pose: {e}')
             return None
-
-    def goal_response_callback(self, future):
-        # Goal response is handled in navigate_to_pose_with_retries
-        pass
 
     def feedback_callback(self, feedback_msg):
         # Optionally process feedback here
