@@ -39,7 +39,7 @@ class BoustrophedonExplorer(Node):
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
-        self.declare_parameter('stuck_timeout', 3.0)  # seconds
+        self.declare_parameter('stuck_timeout', 1.5)  # seconds
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
