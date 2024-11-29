@@ -14,6 +14,7 @@ import scipy.ndimage
 from sklearn.cluster import DBSCAN
 from visualization_msgs.msg import Marker, MarkerArray
 
+
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -75,7 +76,7 @@ class FrontierExplorer(Node):
             if self.exploring:
                 self.get_logger().info('Exploration complete!')
                 self.exploring = False
-                rclpy.shutdown()
+                self.shutdown_node()
             else:
                 self.get_logger().info('Map is fully explored.')
             return
@@ -90,7 +91,7 @@ class FrontierExplorer(Node):
         if frontiers is None or frontiers.size == 0:
             self.get_logger().info('No frontiers detected.')
             self.exploring = False
-            rclpy.shutdown()
+            self.shutdown_node()
             return
 
         # 웨이포인트 생성
@@ -102,7 +103,7 @@ class FrontierExplorer(Node):
         else:
             self.get_logger().info('No valid waypoints found.')
             self.exploring = False
-            rclpy.shutdown()
+            self.shutdown_node()
 
     def detect_frontiers(self):
         # 맵 데이터에서 탐색 전선 검출
@@ -209,9 +210,9 @@ class FrontierExplorer(Node):
             self.get_logger().info(f'Sending goal to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} at ({waypoint.x:.2f}, {waypoint.y:.2f})')
             self.send_goal(goal_pose)
         else:
-            self.get_logger().info('All waypoints have been processed.')
+            self.get_logger().info('All waypoints have been processed. Exploration complete!')
             self.exploring = False
-            rclpy.shutdown()
+            self.shutdown_node()
 
     def send_goal(self, goal_pose):
         goal_msg = NavigateToPose.Goal()
@@ -245,14 +246,6 @@ class FrontierExplorer(Node):
         # 다음 웨이포인트로 이동
         self.current_waypoint_index += 1
         self.send_next_waypoint()
-
-    def follow_waypoints(self, waypoints):
-        # 이 메서드는 더 이상 사용되지 않습니다.
-        pass
-
-    def navigate_to_pose_with_timeout(self, goal_pose, timeout=60.0):
-        # 이 메서드는 더 이상 사용되지 않습니다.
-        pass
 
     def perform_recovery_behavior(self):
         self.get_logger().info('Performing recovery behavior.')
@@ -321,15 +314,23 @@ class FrontierExplorer(Node):
         # 피드백 처리 가능 (현재는 생략)
         pass
 
+    def shutdown_node(self):
+        # 노드가 안전하게 종료되도록 처리
+        self.get_logger().info('Shutting down the node safely.')
+        self.destroy_node()
+        rclpy.shutdown()
+
+
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
     try:
         rclpy.spin(explorer)
     except KeyboardInterrupt:
-        pass
-    explorer.destroy_node()
-    rclpy.shutdown()
+        explorer.get_logger().info('Keyboard Interrupt (SIGINT)')
+    finally:
+        explorer.shutdown_node()
+
 
 if __name__ == '__main__':
     main()
