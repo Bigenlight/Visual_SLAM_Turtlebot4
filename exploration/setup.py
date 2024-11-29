@@ -29,6 +29,7 @@ setup(
             'exploration_node = exploration.exploration:main',
             'exploration_kwi = exploration.exploration_kwi:main',
             'test_node = exploration.test:main',
+            'exploration2_0 = exploration2_0.exploration2_0:main',
         ],
     },
 )
