@@ -10,11 +10,9 @@ from tf2_ros import Buffer, TransformListener
 import math
 import tf2_ros
 from rclpy.duration import Duration
-from skimage import measure
 import scipy.ndimage
 from sklearn.cluster import DBSCAN
 from visualization_msgs.msg import Marker, MarkerArray
-from nav_msgs.msg import MapMetaData
 
 
 class BoustrophedonExplorer(Node):
@@ -33,8 +31,6 @@ class BoustrophedonExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.starting_pose = None  # 시작 위치 저장
-        self.last_map_data = None  # 이전 맵 데이터 저장
 
         # TF 리스너 설정
         self.tf_buffer = Buffer()
@@ -46,7 +42,7 @@ class BoustrophedonExplorer(Node):
         self.get_logger().info('Action server available.')
 
         # 파라미터 선언
-        self.declare_parameter('safe_distance', 0.5)
+        self.declare_parameter('safe_distance', 0.2)  # 안전 거리 감소
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
@@ -67,24 +63,6 @@ class BoustrophedonExplorer(Node):
         # 웨이포인트 마커 퍼블리셔 설정
         self.marker_pub = self.create_publisher(MarkerArray, 'waypoints_markers', 10)
 
-        # 시작 위치 저장
-        self.timer = self.create_timer(1.0, self.initialize_starting_pose)
-
-    def initialize_starting_pose(self):
-        # 먼저 'map' 프레임에서 로봇 위치 시도
-        self.starting_pose = self.get_robot_pose()
-        if self.starting_pose is not None:
-            self.get_logger().info(f'Starting position recorded in map frame at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
-            self.destroy_timer(self.timer)
-        else:
-            # 'map' 프레임이 없으면 'odom' 프레임에서 로봇 위치 시도
-            self.starting_pose = self.get_robot_pose(frame_id='odom')
-            if self.starting_pose is not None:
-                self.get_logger().info(f'Starting position recorded in odom frame at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
-                self.destroy_timer(self.timer)
-            else:
-                self.get_logger().warning('Waiting for robot pose to initialize starting position.')
-
     def map_callback(self, msg):
         # OccupancyGrid 데이터를 NumPy 배열로 변환
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -98,8 +76,7 @@ class BoustrophedonExplorer(Node):
         # 탐색되지 않은 영역이 남아있는지 확인
         if not np.any(unknown):
             if self.exploring:
-                self.get_logger().info('Exploration complete! Returning to starting position...')
-                self.return_to_start()
+                self.get_logger().info('Exploration complete!')
                 self.exploring = False
                 rclpy.shutdown()
             else:
@@ -120,7 +97,6 @@ class BoustrophedonExplorer(Node):
         if not np.any(exploration_frontier):
             self.get_logger().info('No exploration frontier found.')
             self.exploring = False
-            self.return_to_start()
             rclpy.shutdown()
             return
 
@@ -131,7 +107,6 @@ class BoustrophedonExplorer(Node):
         else:
             self.get_logger().info('No valid waypoints found.')
             self.exploring = False
-            self.return_to_start()
             rclpy.shutdown()
 
     def generate_waypoints(self, frontier):
@@ -146,6 +121,7 @@ class BoustrophedonExplorer(Node):
 
         # 유효한 포인트 인덱스 추출
         indices = np.argwhere(valid_points)
+        self.get_logger().info(f'Number of valid points in frontier: {len(indices)}')
         if len(indices) == 0:
             self.get_logger().warning('No valid points found in frontier.')
             return []
@@ -293,19 +269,6 @@ class BoustrophedonExplorer(Node):
         twist.angular.z = 0.0
         self.cmd_vel_pub.publish(twist)
 
-    def return_to_start(self):
-        if self.starting_pose is None:
-            self.get_logger().error('Starting position is unknown. Cannot return to start.')
-            return
-
-        starting_goal_pose = self.create_pose_stamped(self.starting_pose)
-        self.get_logger().info(f'Navigating back to starting position at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
-        success = self.navigate_to_pose_with_timeout(starting_goal_pose, timeout=60.0)
-        if success:
-            self.get_logger().info('Returned to starting position successfully!')
-        else:
-            self.get_logger().warning('Failed to return to starting position.')
-
     def create_pose_stamped(self, position, next_position=None):
         pose = PoseStamped()
         pose.header.frame_id = 'map'
@@ -319,12 +282,8 @@ class BoustrophedonExplorer(Node):
             quaternion = self.euler_to_quaternion(0, 0, yaw)
             pose.pose.orientation = quaternion
         else:
-            # 현재 방향 유지
-            current_orientation = self.get_robot_orientation()
-            if current_orientation is not None:
-                pose.pose.orientation = current_orientation
-            else:
-                pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+            # 기본 방향 설정
+            pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
 
         return pose
 
@@ -352,20 +311,6 @@ class BoustrophedonExplorer(Node):
                 tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
             self.get_logger().warning(f'Could not get robot pose in {frame_id} frame: {e}')
-            return None
-
-    def get_robot_orientation(self):
-        try:
-            now = rclpy.time.Time()
-            trans = self.tf_buffer.lookup_transform(
-                'map',
-                'base_link',
-                rclpy.time.Time(),
-                timeout=Duration(seconds=1.0))
-            return trans.transform.rotation
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException):
             return None
 
     def feedback_callback(self, feedback_msg):
