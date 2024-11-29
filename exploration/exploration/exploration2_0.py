@@ -37,6 +37,13 @@ class FrontierExplorer(Node):
         self.retry_count = 0
         self.goal_timeout = 30.0  # Goal reach timeout in seconds
 
+        # Movement monitoring variables
+        self.last_moving_position = None
+        self.last_moving_time = None
+        self.movement_check_interval = 1.0  # Check every 1 second
+        self.movement_threshold = 0.10  # 10 cm
+        self.movement_timeout = 5.0  # 5 seconds without movement
+
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
@@ -95,8 +102,8 @@ class FrontierExplorer(Node):
         )
         send_goal_future.add_done_callback(self.goal_response_callback)
 
-        # Start a timer for goal timeout
-        self.goal_timer = self.create_timer(self.goal_timeout, self.goal_timeout_callback, callback_group=None)
+        # Start the movement monitoring timer
+        self.start_movement_monitoring()
 
     def detect_frontiers(self):
         # Find free cells that are adjacent to unknown cells
@@ -160,13 +167,17 @@ class FrontierExplorer(Node):
             dx = frontier.x - robot_position.x
             dy = frontier.y - robot_position.y
             distance = math.hypot(dx, dy)
+            self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
             if self.min_frontier_distance <= distance <= self.max_frontier_distance:
                 # Check if the goal is safe
-                if self.is_goal_safe(frontier.x, frontier.y, self.safety_distance):
+                is_safe = self.is_goal_safe(frontier.x, frontier.y, self.safety_distance)
+                self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) is within distance range and safety check result: {is_safe}')
+                if is_safe:
                     valid_frontiers.append(frontier)
                     distances.append(distance)
                     self.get_logger().info(f'Valid frontier at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
-
+            else:
+                self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) is out of distance range.')
         if not valid_frontiers:
             return None
 
@@ -179,11 +190,6 @@ class FrontierExplorer(Node):
     def is_goal_safe(self, goal_x, goal_y, safety_distance=0.5):
         """
         Check if the goal position is safe by ensuring there are no obstacles within the safety distance.
-        
-        :param goal_x: Goal x position in meters
-        :param goal_y: Goal y position in meters
-        :param safety_distance: Safety distance in meters
-        :return: True if safe, False otherwise
         """
         if self.map_info is None or self.map_data is None:
             return False
@@ -204,8 +210,11 @@ class FrontierExplorer(Node):
         # Check each cell within the safety distance
         for y in range(min_y, max_y + 1):
             for x in range(min_x, max_x + 1):
-                if self.map_data[y, x] > 50:  # Threshold for obstacle, adjust as needed
+                cell_value = self.map_data[y, x]
+                if cell_value > 50:  # Threshold for obstacle, adjust as needed
+                    self.get_logger().debug(f'Obstacle found at grid ({x}, {y}) with value {cell_value}')
                     return False
+        self.get_logger().debug(f'Goal at ({goal_x:.2f}, {goal_y:.2f}) is safe.')
         return True
 
     def get_neighbors(self, x, y):
@@ -230,6 +239,7 @@ class FrontierExplorer(Node):
     def get_robot_pose(self):
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            self.get_logger().debug(f'Robot position: ({trans.transform.translation.x:.2f}, {trans.transform.translation.y:.2f})')
             return trans.transform.translation
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
             self.get_logger().error(f'Could not get robot pose: {e}')
@@ -253,7 +263,7 @@ class FrontierExplorer(Node):
         self.get_logger().info('Goal accepted :)')
         self.current_goal = goal_handle
 
-        # Cancel the goal timer since the goal was accepted
+        # Cancel the goal timeout timer since the goal was accepted
         if hasattr(self, 'goal_timer'):
             self.goal_timer.cancel()
 
@@ -276,6 +286,9 @@ class FrontierExplorer(Node):
             self.get_logger().info(f'Goal failed with status: {status}')
             self.handle_goal_failure()
 
+        # Stop the movement monitoring timer
+        self.stop_movement_monitoring()
+
         # Look for the next frontier
         self.find_and_navigate_to_frontier()
 
@@ -296,16 +309,9 @@ class FrontierExplorer(Node):
     def goal_timeout_callback(self):
         if self.current_goal is not None:
             self.get_logger().warn('Goal timeout reached. Cancelling the current goal.')
-            try:
-                cancel_future = self.navigator.cancel_goal_async(self.current_goal)
-                cancel_future.add_done_callback(self.cancel_goal_response_callback)
-            except AttributeError as e:
-                self.get_logger().error(f'Failed to cancel goal: {e}')
-
-            # Reset variables
-            self.current_goal = None
-            self.exploring = False  # Allow retry
-            self.stop_robot()
+            self.cancel_current_goal()
+            # Start looking for a new frontier
+            self.find_and_navigate_to_frontier()
 
     def cancel_goal_response_callback(self, future):
         try:
@@ -328,6 +334,60 @@ class FrontierExplorer(Node):
         stop_msg.angular.z = 0.0
         self.cmd_vel_publisher.publish(stop_msg)
         self.get_logger().info('Sent stop command to the robot.')
+
+    # Movement monitoring methods
+    def start_movement_monitoring(self):
+        self.last_moving_position = self.get_robot_pose()
+        self.last_moving_time = self.get_clock().now()
+        self.movement_timer = self.create_timer(self.movement_check_interval, self.check_movement_callback)
+        self.get_logger().debug('Started movement monitoring.')
+
+    def stop_movement_monitoring(self):
+        if hasattr(self, 'movement_timer'):
+            self.movement_timer.cancel()
+            self.get_logger().debug('Stopped movement monitoring.')
+
+    def check_movement_callback(self):
+        current_time = self.get_clock().now()
+        current_position = self.get_robot_pose()
+        if current_position is None or self.last_moving_position is None:
+            return  # Can't get position
+
+        # Compute distance moved since last moving time
+        dx = current_position.x - self.last_moving_position.x
+        dy = current_position.y - self.last_moving_position.y
+        distance_moved = math.hypot(dx, dy)
+
+        if distance_moved >= self.movement_threshold:
+            # Robot has moved more than threshold, update last moving position and time
+            self.last_moving_position = current_position
+            self.last_moving_time = current_time
+            self.get_logger().debug('Robot has moved significantly.')
+        else:
+            # Robot hasn't moved significantly
+            time_since_last_move = (current_time - self.last_moving_time).nanoseconds / 1e9  # seconds
+            self.get_logger().debug(f'Robot has not moved significantly for {time_since_last_move:.2f} seconds.')
+            if time_since_last_move >= self.movement_timeout:
+                # Robot hasn't moved threshold distance in movement_timeout seconds, consider stuck
+                self.get_logger().warn('Robot is stuck, cancelling goal and sending a new one.')
+                self.cancel_current_goal()
+                # Start looking for a new frontier
+                self.find_and_navigate_to_frontier()
+
+    def cancel_current_goal(self):
+        if self.current_goal is not None:
+            try:
+                cancel_future = self.navigator.cancel_goal_async(self.current_goal)
+                cancel_future.add_done_callback(self.cancel_goal_response_callback)
+            except Exception as e:
+                self.get_logger().error(f'Failed to cancel goal: {e}')
+            self.current_goal = None
+            self.exploring = False  # Allow retry
+            self.stop_robot()
+            self.stop_movement_monitoring()
+            # Reset movement monitoring variables
+            self.last_moving_position = None
+            self.last_moving_time = None
 
 def main(args=None):
     rclpy.init(args=args)
