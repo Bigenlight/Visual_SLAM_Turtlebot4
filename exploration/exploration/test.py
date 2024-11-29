@@ -46,19 +46,19 @@ class BoustrophedonExplorer(Node):
         self.get_logger().info('Action server available.')
 
         # 파라미터 선언
-        self.declare_parameter('safe_distance', 0.7)  # 안전 거리 증가
+        self.declare_parameter('safe_distance', 0.5)
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
         self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
 
-        self.declare_parameter('stuck_timeout', 30.0)  # 초 단위
+        self.declare_parameter('stuck_timeout', 30.0)
         self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
 
-        self.declare_parameter('waypoint_spacing', 0.5)  # 미터 단위
+        self.declare_parameter('waypoint_spacing', 0.5)
         self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
 
-        self.declare_parameter('robot_width', 0.35)  # 로봇의 폭 (미터 단위)
+        self.declare_parameter('robot_width', 0.35)
         self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
 
         # cmd_vel 퍼블리셔 설정 (회복 행동용)
@@ -71,12 +71,19 @@ class BoustrophedonExplorer(Node):
         self.timer = self.create_timer(1.0, self.initialize_starting_pose)
 
     def initialize_starting_pose(self):
+        # 먼저 'map' 프레임에서 로봇 위치 시도
         self.starting_pose = self.get_robot_pose()
         if self.starting_pose is not None:
-            self.get_logger().info(f'Starting position recorded at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
+            self.get_logger().info(f'Starting position recorded in map frame at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
             self.destroy_timer(self.timer)
         else:
-            self.get_logger().warning('Waiting for robot pose to initialize starting position.')
+            # 'map' 프레임이 없으면 'odom' 프레임에서 로봇 위치 시도
+            self.starting_pose = self.get_robot_pose(frame_id='odom')
+            if self.starting_pose is not None:
+                self.get_logger().info(f'Starting position recorded in odom frame at ({self.starting_pose.x:.2f}, {self.starting_pose.y:.2f})')
+                self.destroy_timer(self.timer)
+            else:
+                self.get_logger().warning('Waiting for robot pose to initialize starting position.')
 
     def map_callback(self, msg):
         # OccupancyGrid 데이터를 NumPy 배열로 변환
@@ -332,11 +339,11 @@ class BoustrophedonExplorer(Node):
              math.sin(roll / 2) * math.sin(pitch / 2) * math.sin(yaw / 2)
         return Quaternion(x=qx, y=qy, z=qz, w=qw)
 
-    def get_robot_pose(self):
+    def get_robot_pose(self, frame_id='map'):
         try:
             now = rclpy.time.Time()
             trans = self.tf_buffer.lookup_transform(
-                'map',
+                frame_id,
                 'base_link',
                 rclpy.time.Time(),
                 timeout=Duration(seconds=1.0))
@@ -344,7 +351,7 @@ class BoustrophedonExplorer(Node):
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
-            self.get_logger().error(f'Could not get robot pose: {e}')
+            self.get_logger().warning(f'Could not get robot pose in {frame_id} frame: {e}')
             return None
 
     def get_robot_orientation(self):
