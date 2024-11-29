@@ -7,12 +7,15 @@ from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 import numpy as np
 from tf2_ros import Buffer, TransformListener
+import tf2_ros  # tf2_ros 모듈 import 추가
 import math
 from rclpy.duration import Duration
 import scipy.ndimage
 from sklearn.cluster import DBSCAN
 from visualization_msgs.msg import Marker, MarkerArray
-
+import os
+import json
+import datetime
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -42,7 +45,7 @@ class FrontierExplorer(Node):
         self.navigator.wait_for_server()
         self.get_logger().info('Action server available.')
 
-        # 파라미터 선언
+        # 파라미터 선언 및 초기화
         self.declare_parameter('safe_distance', 0.2)  # 안전 거리 조정
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
@@ -58,29 +61,39 @@ class FrontierExplorer(Node):
         self.declare_parameter('robot_width', 0.35)
         self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
 
+        self.declare_parameter('map_save_directory', '/tmp/maps')  # 맵 저장 디렉토리
+        self.map_save_directory = self.get_parameter('map_save_directory').get_parameter_value().string_value
+        os.makedirs(self.map_save_directory, exist_ok=True)
+
         # cmd_vel 퍼블리셔 설정 (회복 행동용)
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
         # 웨이포인트 마커 퍼블리셔 설정
         self.marker_pub = self.create_publisher(MarkerArray, 'waypoints_markers', 10)
 
+        # 현재 목표 상태 추적
+        self.current_goal_active = False
+
     def map_callback(self, msg):
         # OccupancyGrid 데이터를 NumPy 배열로 변환
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
         self.map_info = msg.info
 
+        # 맵 데이터를 파일로 저장
+        self.save_map_to_file(msg)
+
         # 탐색되지 않은 영역이 남아있는지 확인
         unknown = self.map_data == -1
         if not np.any(unknown):
             if self.exploring:
-                self.get_logger().info('Exploration complete!')
+                self.get_logger().info('Exploration complete! All areas have been explored.')
                 self.exploring = False
                 self.shutdown_node()
             else:
                 self.get_logger().info('Map is fully explored.')
             return
 
-        if not self.exploring:
+        if not self.exploring and not self.current_goal_active:
             self.exploring = True
             self.plan_and_execute_exploration()
 
@@ -208,9 +221,10 @@ class FrontierExplorer(Node):
             self.get_logger().info(f'Sending goal to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} at ({waypoint.x:.2f}, {waypoint.y:.2f})')
             self.send_goal(goal_pose)
         else:
-            self.get_logger().info('All waypoints have been processed. Exploration complete!')
+            self.get_logger().info('All current waypoints have been processed. Checking for new frontiers...')
             self.exploring = False
-            self.shutdown_node()
+            # 새로운 맵 업데이트를 기다리기 위해 노드를 종료하지 않고 맵 콜백에서 다시 탐색 시도
+            # 즉, map_callback이 다시 호출될 때 plan_and_execute_exploration()이 실행됨
 
     def send_goal(self, goal_pose):
         goal_msg = NavigateToPose.Goal()
@@ -219,11 +233,13 @@ class FrontierExplorer(Node):
         self.get_logger().info('Sending goal to the action server.')
         send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
         send_goal_future.add_done_callback(self.goal_response_callback)
+        self.current_goal_active = True
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warning('Goal rejected by the action server.')
+            self.current_goal_active = False
             self.current_waypoint_index += 1
             self.send_next_waypoint()
             return
@@ -233,15 +249,19 @@ class FrontierExplorer(Node):
         goal_handle.get_result_async().add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        result = future.result().result
-        status = future.result().status
+        try:
+            result = future.result().result
+            status = future.result().status
 
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('Waypoint reached successfully!')
-        else:
-            self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info('Waypoint reached successfully!')
+            else:
+                self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
+        except Exception as e:
+            self.get_logger().error(f'Error in get_result_callback: {e}')
 
         # 다음 웨이포인트로 이동
+        self.current_goal_active = False
         self.current_waypoint_index += 1
         self.send_next_waypoint()
 
@@ -319,6 +339,49 @@ class FrontierExplorer(Node):
             self.destroy_node()
             rclpy.shutdown()
 
+    def save_map_to_file(self, map_msg):
+        # 맵 데이터를 JSON 파일로 저장
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        map_filename = os.path.join(self.map_save_directory, f'map_{timestamp}.json')
+        map_dict = {
+            'header': {
+                'stamp': {
+                    'sec': map_msg.header.stamp.sec,
+                    'nanosec': map_msg.header.stamp.nanosec
+                },
+                'frame_id': map_msg.header.frame_id
+            },
+            'info': {
+                'map_load_time': {
+                    'sec': map_msg.info.map_load_time.sec,
+                    'nanosec': map_msg.info.map_load_time.nanosec
+                },
+                'resolution': map_msg.info.resolution,
+                'width': map_msg.info.width,
+                'height': map_msg.info.height,
+                'origin': {
+                    'position': {
+                        'x': map_msg.info.origin.position.x,
+                        'y': map_msg.info.origin.position.y,
+                        'z': map_msg.info.origin.position.z
+                    },
+                    'orientation': {
+                        'x': map_msg.info.origin.orientation.x,
+                        'y': map_msg.info.origin.orientation.y,
+                        'z': map_msg.info.origin.orientation.z,
+                        'w': map_msg.info.origin.orientation.w
+                    }
+                }
+            },
+            'data': map_msg.data.tolist()
+        }
+
+        try:
+            with open(map_filename, 'w') as f:
+                json.dump(map_dict, f, indent=4)
+            self.get_logger().info(f'Map saved to {map_filename}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to save map to file: {e}')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -327,9 +390,10 @@ def main(args=None):
         rclpy.spin(explorer)
     except KeyboardInterrupt:
         explorer.get_logger().info('Keyboard Interrupt (SIGINT)')
+    except Exception as e:
+        explorer.get_logger().error(f'Exception in main: {e}')
     finally:
         explorer.shutdown_node()
-
 
 if __name__ == '__main__':
     main()
