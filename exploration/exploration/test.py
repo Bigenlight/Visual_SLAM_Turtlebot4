@@ -41,7 +41,7 @@ class FrontierExplorer(Node):
         self.get_logger().info('Action server available.')
 
         # 파라미터 선언
-        self.declare_parameter('safe_distance', 0.2)
+        self.declare_parameter('safe_distance', 0.2)  # 안전 거리 조정
         self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
 
         self.declare_parameter('recovery_behavior_enabled', True)
@@ -85,7 +85,7 @@ class FrontierExplorer(Node):
     def plan_and_execute_exploration(self):
         # 탐색 전선 검출
         frontiers = self.detect_frontiers()
-        if not frontiers:
+        if frontiers is None or frontiers.size == 0:
             self.get_logger().info('No frontiers detected.')
             self.exploring = False
             rclpy.shutdown()
@@ -107,7 +107,7 @@ class FrontierExplorer(Node):
         unknown = self.map_data == -1
 
         # 알려진 공간과 미탐색 공간의 경계 찾기
-        kernel = np.ones((3, 3))
+        kernel = np.ones((3, 3), dtype=np.uint8)
         unknown_dilated = scipy.ndimage.binary_dilation(unknown, structure=kernel)
         border = unknown_dilated & free
 
@@ -121,6 +121,10 @@ class FrontierExplorer(Node):
         # 좌표 변환 (x, y)
         points = frontiers[:, [1, 0]].astype(float)  # x, y 순서로 변경
         points = points * self.map_info.resolution + np.array([self.map_info.origin.position.x, self.map_info.origin.position.y])
+
+        if points.size == 0:
+            self.get_logger().warning('No points available for clustering.')
+            return []
 
         # 클러스터링 적용
         clustering = DBSCAN(eps=self.waypoint_spacing, min_samples=3).fit(points)
@@ -328,7 +332,8 @@ class FrontierExplorer(Node):
             return trans.transform.translation
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException):
+                tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warning(f'Could not get robot pose in map frame: {e}')
             return None
 
     def feedback_callback(self, feedback_msg):
