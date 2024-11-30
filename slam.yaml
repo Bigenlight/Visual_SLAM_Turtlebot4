@@ -20,7 +20,7 @@ slam_toolbox:
     throttle_scans: 1
     transform_publish_period: 0.02 #if 0 never publishes odometry
     map_update_interval: 0.5
-    resolution: 0.02 # 수정
+    resolution: 0.01 # 수정
     max_laser_range: 15.0 #for rastering images # 수정
     minimum_time_interval: 0.25
     transform_timeout: 0.2
