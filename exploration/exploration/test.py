@@ -51,7 +51,7 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
-        self.movement_threshold = 0.5  # 10 cm
+        self.movement_threshold = 0.1  # 10 cm
         self.movement_timeout = 10.0  # 10초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
@@ -194,7 +194,7 @@ class FrontierExplorer(Node):
         unknown_cells = np.count_nonzero(self.map_data == -1)
         unknown_ratio = unknown_cells / total_cells
 
-        self.get_logger().info(f'미지 영역 비율: {unknown_ratio:.2%}')
+        self.get_logger().info(f'미지 영역 비율: {unknown_ratio:.2}')
 
         # 접근 가능한 미지 영역 비율 계산
         accessible_unknown_cells = self.count_accessible_unknown_cells()
@@ -431,7 +431,7 @@ class FrontierExplorer(Node):
         my = self.map_info.origin.position.y + (y + 0.5) * self.map_info.resolution
         return mx, my
 
-    def get_robot_pose(self):
+    def get_robot_pose(self): ### 이제
         """
         로봇의 현재 위치를 'odom' 프레임에서 가져옵니다.
         """
