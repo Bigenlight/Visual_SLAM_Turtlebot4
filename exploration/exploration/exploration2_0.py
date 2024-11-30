@@ -42,8 +42,8 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
-        self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 8.0  # seconds without movement
+        self.movement_threshold = 0.05  # 10 cm
+        self.movement_timeout = 10.0  # seconds without movement
 
         # No-frontier timer variables
         self.no_frontier_timer = None
