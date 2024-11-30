@@ -3,14 +3,12 @@ from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Point, Twist
 from nav2_msgs.action import NavigateToPose
-from nav2_msgs.srv import SaveMap
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 import numpy as np
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 import math
 from sklearn.cluster import DBSCAN
-from std_msgs.msg import String
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -45,18 +43,12 @@ class FrontierExplorer(Node):
         self.movement_threshold = 0.10  # 10 cm
         self.movement_timeout = 4.0  # 3 seconds without movement
 
-<<<<<<< HEAD
-=======
         # No-frontier timer variables
         self.no_frontier_timer = None
         self.no_frontier_duration = 60.0  # 10 seconds without frontiers
 
->>>>>>> 89faf18c8f033754c22119f53d489aeae0e290ed
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-
-        # Publisher to the 'cleaning' topic to signal the next phase
-        self.cleaning_publisher = self.create_publisher(String, 'cleaning', 10)
 
         # TF2 Buffer and Listener
         self.tf_buffer = Buffer()
@@ -66,12 +58,6 @@ class FrontierExplorer(Node):
         self.get_logger().info('Waiting for NavigateToPose action server...')
         self.navigator.wait_for_server()
         self.get_logger().info('NavigateToPose action server ready.')
-
-        # Service client to save the map
-        self.save_map_client = self.create_client(SaveMap, 'save_map')
-        self.get_logger().info('Waiting for save_map service...')
-        self.save_map_client.wait_for_service()
-        self.get_logger().info('save_map service available.')
 
         # Initialize visited frontiers list
         self.visited_frontiers = []
@@ -97,25 +83,46 @@ class FrontierExplorer(Node):
         frontiers = self.detect_frontiers()
 
         if not frontiers:
-            self.get_logger().info('No frontiers detected. Mapping complete.')
-            self.mapping_complete()
-            return  # Exit exploration
+            self.get_logger().info('No frontiers detected.')
+            # Start the no-frontier timer if not already started
+            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+                self.get_logger().info('Starting no-frontier timer.')
+                self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            return  # Exit without stopping exploration yet
+
+        # If frontiers are found and the no-frontier timer is running, cancel it
+        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.no_frontier_timer.cancel()
+            self.no_frontier_timer = None
+            self.get_logger().info('Frontiers detected. No-frontier timer cancelled.')
 
         # Cluster the frontiers
         clustered_frontiers = self.cluster_frontiers(frontiers)
 
         if not clustered_frontiers:
-            self.get_logger().info('No valid frontiers after clustering. Mapping complete.')
-            self.mapping_complete()
-            return  # Exit exploration
+            self.get_logger().info('No valid frontiers after clustering.')
+            # Start the no-frontier timer if not already started
+            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+                self.get_logger().info('Starting no-frontier timer.')
+                self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            return  # Exit without stopping exploration yet
 
         # Select the closest valid frontier within min and max distance
         goal_position = self.select_frontier(clustered_frontiers)
 
         if goal_position is None:
-            self.get_logger().info('No reachable and safe frontiers found within the specified distance range. Mapping complete.')
-            self.mapping_complete()
-            return  # Exit exploration
+            self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
+            # Start the no-frontier timer if not already started
+            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+                self.get_logger().info('Starting no-frontier timer.')
+                self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            return  # Exit without stopping exploration yet
+
+        # If we have a goal, cancel the no-frontier timer if running
+        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.no_frontier_timer.cancel()
+            self.no_frontier_timer = None
+            self.get_logger().info('Valid frontier selected. No-frontier timer cancelled.')
 
         # Create and send a navigation goal
         goal_msg = NavigateToPose.Goal()
@@ -136,50 +143,14 @@ class FrontierExplorer(Node):
         # Start the movement monitoring timer
         self.start_movement_monitoring()
 
-    def mapping_complete(self):
+    def no_frontier_timer_callback(self):
         """
-        Handles actions to perform when mapping is complete.
+        Callback function for the no-frontier timer.
+        Stops exploration and shuts down the node after 10 seconds without frontiers.
         """
-        self.get_logger().info('Mapping complete. Saving the map and notifying cleaning node.')
-        # Stop the robot
+        self.get_logger().info('The map is closed! No new frontiers detected for 10 seconds.')
         self.stop_robot()
-        # Save the map
-        self.save_map()
-        # Publish to cleaning topic
-        self.publish_cleaning_signal()
-        # Shutdown the node
         self.shutdown()
-
-    def save_map(self):
-        """
-        Calls the save_map service to save the map to the specified path.
-        """
-        save_map_request = SaveMap.Request()
-        save_map_request.map_topic = 'map'
-        save_map_request.map_url = '/home/rokey/4_ws/src/map/map'  # The base name of the map file
-        save_map_request.image_format = 'pgm'
-        save_map_request.map_mode = 'trinary'
-        save_map_request.free_thresh = 0.25
-        save_map_request.occupied_thresh = 0.65
-
-        future = self.save_map_client.call_async(save_map_request)
-        future.add_done_callback(self.save_map_response_callback)
-
-    def save_map_response_callback(self, future):
-        try:
-            response = future.result()
-            self.get_logger().info(f'Map saved successfully at {response.result}')
-        except Exception as e:
-            self.get_logger().error(f'Failed to save map: {e}')
-
-    def publish_cleaning_signal(self):
-        """
-        Publishes a message to the 'cleaning' topic to signal the next cleaning algorithm to start.
-        """
-        msg = String()
-        msg.data = 'start_cleaning'
-        self.cleaning_publisher.publish(msg)
-        self.get_logger().info('Published cleaning signal.')
 
     def shutdown(self):
         """
@@ -189,6 +160,8 @@ class FrontierExplorer(Node):
         # Cancel any running timers
         if hasattr(self, 'movement_timer') and self.movement_timer is not None:
             self.movement_timer.cancel()
+        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.no_frontier_timer.cancel()
         # Destroy the node
         self.destroy_node()
         rclpy.shutdown()
@@ -440,7 +413,6 @@ class FrontierExplorer(Node):
             self.get_logger().warn('Maximum retries reached. Stopping exploration.')
             self.exploring = False
             self.stop_robot()
-            self.mapping_complete()
         else:
             self.get_logger().info('Retrying with a new frontier.')
             self.find_and_navigate_to_frontier()
@@ -451,6 +423,29 @@ class FrontierExplorer(Node):
         Currently unused but can be implemented as needed.
         """
         pass
+
+    def goal_timeout_callback(self):
+        """
+        Callback for handling goal timeouts. Cancels the current goal if timeout is reached.
+        """
+        if self.current_goal is not None:
+            self.get_logger().warn('Goal timeout reached. Cancelling the current goal.')
+            self.cancel_current_goal()
+            # Start looking for a new frontier
+            self.find_and_navigate_to_frontier()
+
+    def cancel_goal_response_callback(self, future):
+        """
+        Callback for handling the response from the action server after cancelling a goal.
+        """
+        try:
+            response = future.result()
+            if len(response.goals_canceling) > 0:
+                self.get_logger().info('Goal successfully cancelled.')
+            else:
+                self.get_logger().info('No goals were cancelled.')
+        except Exception as e:
+            self.get_logger().error(f'Failed to cancel goal: {e}')
 
     def stop_robot(self):
         """
@@ -532,18 +527,29 @@ class FrontierExplorer(Node):
             self.last_moving_position = None
             self.last_moving_time = None
 
-    def cancel_goal_response_callback(self, future):
+    def check_map_closed_callback(self):
         """
-        Callback for handling the response from the action server after cancelling a goal.
+        Periodically checks if no new frontiers have been detected for the specified duration.
+        If so, it logs a message and shuts down the node.
         """
-        try:
-            response = future.result()
-            if len(response.goals_canceling) > 0:
-                self.get_logger().info('Goal successfully cancelled.')
-            else:
-                self.get_logger().info('No goals were cancelled.')
-        except Exception as e:
-            self.get_logger().error(f'Failed to cancel goal: {e}')
+        current_time = self.get_clock().now()
+        time_since_last_frontier = (current_time - self.last_frontier_time).nanoseconds / 1e9  # Convert to seconds
+
+        if time_since_last_frontier >= self.map_closed_duration:
+            self.get_logger().info('The map is closed! Shutting down the explorer node.')
+            self.stop_robot()
+            rclpy.shutdown()
+
+    def cancel_all_timers(self):
+        """
+        Cancels all active timers to ensure clean shutdown.
+        """
+        if hasattr(self, 'map_closed_timer'):
+            self.map_closed_timer.cancel()
+        if hasattr(self, 'movement_timer'):
+            self.movement_timer.cancel()
+        if hasattr(self, 'goal_timer'):
+            self.goal_timer.cancel()
 
 def main(args=None):
     rclpy.init(args=args)
