@@ -10,6 +10,7 @@ from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityExce
 import math
 from sklearn.cluster import DBSCAN
 from std_msgs.msg import Bool
+from collections import deque
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -30,10 +31,10 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 4.0  # 최대 탐사 거리 (미터)
-        self.min_frontier_distance = 0.4  # 최소 목표 거리 (미터, 허용 오차)
+        self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
+        self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
         self.safety_distance = 0.1  # 안전 거리 (미터)
-        self.max_retries = 10 # 최대 목표 재시도 횟수
+        self.max_retries = 3  # 최대 목표 재시도 횟수
         self.retry_count = 0
         self.goal_timeout = 30.0  # 목표 도달 타임아웃 (초)
 
@@ -42,7 +43,7 @@ class FrontierExplorer(Node):
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
         self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 5.0  # 3초 동안 이동하지 않으면 정지
+        self.movement_timeout = 3.0  # 3초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -59,7 +60,7 @@ class FrontierExplorer(Node):
         # 방문한 프론티어 목록 초기화
         self.visited_frontiers = []
         self.failed_frontiers = []  # 실패한 프론티어를 기록할 리스트
-        self.frontier_distance_threshold = 0.4  # 25 cm 이내의 프론티어는 방문한 것으로 간주
+        self.frontier_distance_threshold = 0.25  # 25 cm 이내의 프론티어는 방문한 것으로 간주
 
         # 현재 목표 위치를 저장할 변수
         self.current_goal_position = None
@@ -89,7 +90,7 @@ class FrontierExplorer(Node):
         if not frontiers:
             self.get_logger().info('프론티어가 감지되지 않았습니다.')
 
-            # 맵의 미지 영역 비율을 확인하여 맵핑 완료 여부 판단
+            # 맵의 미지 영역 비율과 접근 가능한 미지 영역 비율을 확인하여 맵핑 완료 여부 판단
             if self.is_map_explored():
                 self.get_logger().info('맵이 충분히 탐사되었습니다. 탐사가 완료되었습니다.')
                 self.stop_robot()
@@ -135,9 +136,6 @@ class FrontierExplorer(Node):
         # 목표 지점이 있으면 탐사 진행
         self.current_goal_position = goal_position  # 현재 목표 위치 저장
 
-        # 네프론티어 타이머가 실행 중이면 취소
-        # 기존에 no_frontier_timer를 제거했으므로 관련 코드는 생략
-
         # 네비게이션 목표 메시지 생성
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = PoseStamped()
@@ -159,7 +157,7 @@ class FrontierExplorer(Node):
 
     def is_map_explored(self):
         """
-        맵의 미지 영역 비율을 계산하여 맵핑이 완료되었는지 판단합니다.
+        맵의 미지 영역 비율과 접근 가능한 미지 영역 비율을 계산하여 맵핑이 완료되었는지 판단합니다.
         """
         if self.map_data is None:
             return False
@@ -170,11 +168,58 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'미지 영역 비율: {unknown_ratio:.2%}')
 
-        # 임계값 설정 (예: 미지 영역이 0.1% 미만일 때 탐색 완료로 판단)
-        if unknown_ratio < 0.001:
+        # 접근 가능한 미지 영역 비율 계산
+        accessible_unknown_cells = self.count_accessible_unknown_cells()
+        accessible_unknown_ratio = accessible_unknown_cells / total_cells
+
+        self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
+
+        # 임계값 설정 (예: 접근 가능한 미지 영역이 0.1% 미만일 때 탐색 완료로 판단)
+        if accessible_unknown_ratio < 0.001:
             return True
         else:
             return False
+
+    def count_accessible_unknown_cells(self):
+        """
+        접근 가능한 미지 영역의 수를 계산합니다.
+        접근 가능성은 로봇의 현재 위치에서 BFS를 통해 확인합니다.
+        """
+        if self.map_data is None or self.map_info is None:
+            return 0
+
+        # 로봇의 현재 위치를 그리드 좌표로 변환
+        robot_pose = self.get_robot_pose()
+        if robot_pose is None:
+            self.get_logger().warn('로봇의 위치를 가져올 수 없어 접근 가능한 미지 영역을 계산할 수 없습니다.')
+            return 0
+
+        robot_grid_x = int((robot_pose.x - self.map_info.origin.position.x) / self.map_info.resolution)
+        robot_grid_y = int((robot_pose.y - self.map_info.origin.position.y) / self.map_info.resolution)
+
+        height, width = self.map_data.shape
+        visited = np.zeros((height, width), dtype=bool)
+        queue = deque()
+        queue.append((robot_grid_x, robot_grid_y))
+        visited[robot_grid_y, robot_grid_x] = True
+
+        accessible_unknown = 0
+
+        while queue:
+            x, y = queue.popleft()
+
+            neighbors = self.get_neighbors(x, y)
+            for nx, ny in neighbors:
+                if not visited[ny, nx]:
+                    if self.map_data[ny, nx] == 0:  # 자유 공간
+                        visited[ny, nx] = True
+                        queue.append((nx, ny))
+                    elif self.map_data[ny, nx] == -1:  # 미지 공간
+                        accessible_unknown += 1
+                        visited[ny, nx] = True  # 방문 표시하여 중복 계산 방지
+
+        self.get_logger().info(f'접근 가능한 미지 영역 수: {accessible_unknown}')
+        return accessible_unknown
 
     def detect_frontiers(self):
         """
@@ -298,11 +343,13 @@ class FrontierExplorer(Node):
         goal_grid_x = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
         goal_grid_y = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
 
+        height, width = self.map_data.shape
+
         # 검사할 그리드 범위 정의
         min_x = max(goal_grid_x - num_cells, 0)
-        max_x = min(goal_grid_x + num_cells, self.map_data.shape[1] - 1)
+        max_x = min(goal_grid_x + num_cells, width - 1)
         min_y = max(goal_grid_y - num_cells, 0)
-        max_y = min(goal_grid_y + num_cells, self.map_data.shape[0] - 1)
+        max_y = min(goal_grid_y + num_cells, height - 1)
 
         # 안전 거리 내의 각 셀을 검사
         for y in range(min_y, max_y + 1):
@@ -436,6 +483,7 @@ class FrontierExplorer(Node):
             self.current_goal_position = None  # 현재 목표 위치 초기화
             self.exploring = False
             self.stop_robot()
+            self.shutdown()
         else:
             self.get_logger().info('같은 프론티어로 재시도합니다.')
             self.navigate_to_current_goal()
