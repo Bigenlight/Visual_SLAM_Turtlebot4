@@ -11,6 +11,7 @@ import math
 from sklearn.cluster import DBSCAN
 from visualization_msgs.msg import Marker, MarkerArray
 
+
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -35,18 +36,18 @@ class FrontierExplorer(Node):
         self.safety_distance = 0.1  # Safety distance in meters
         self.max_retries = 3  # Maximum number of goal retries
         self.retry_count = 0
-        self.goal_timeout = 20.0  # Goal reach timeout in seconds
+        self.goal_timeout = 30.0  # Goal reach timeout in seconds
 
         # Movement monitoring variables
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
         self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 5.0  # 3 seconds without movement
+        self.movement_timeout = 8.0  # seconds without movement
 
         # No-frontier timer variables
         self.no_frontier_timer = None
-        self.no_frontier_duration = 60.0  # 10 seconds without frontiers
+        self.no_frontier_duration = 60.0  # seconds without frontiers
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -62,8 +63,9 @@ class FrontierExplorer(Node):
 
         # Initialize visited frontiers list
         self.visited_frontiers = []
-        self.frontier_distance_threshold = 0.1  # 25 cm to consider a frontier as visited
+        self.frontier_distance_threshold = 0.25  # 25 cm to consider a frontier as visited
 
+        # Publisher for RViz markers
         self.marker_publisher = self.create_publisher(MarkerArray, 'frontier_markers', 10)
 
     def map_callback(self, msg):
@@ -82,19 +84,22 @@ class FrontierExplorer(Node):
         """
         Detects frontiers, clusters them, selects a valid frontier, and sends a navigation goal.
         """
+        self.get_logger().debug('Starting find_and_navigate_to_frontier.')
+
         # Frontier detection logic
         frontiers = self.detect_frontiers()
 
         if not frontiers:
             self.get_logger().info('No frontiers detected.')
             # Start the no-frontier timer if not already started
-            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+            if self.no_frontier_timer is None:
                 self.get_logger().info('Starting no-frontier timer.')
                 self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            self.exploring = False  # Allow exploration to be re-triggered
             return  # Exit without stopping exploration yet
 
         # If frontiers are found and the no-frontier timer is running, cancel it
-        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+        if self.no_frontier_timer is not None:
             self.no_frontier_timer.cancel()
             self.no_frontier_timer = None
             self.get_logger().info('Frontiers detected. No-frontier timer cancelled.')
@@ -105,9 +110,10 @@ class FrontierExplorer(Node):
         if not clustered_frontiers:
             self.get_logger().info('No valid frontiers after clustering.')
             # Start the no-frontier timer if not already started
-            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+            if self.no_frontier_timer is None:
                 self.get_logger().info('Starting no-frontier timer.')
                 self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            self.exploring = False  # Allow exploration to be re-triggered
             return  # Exit without stopping exploration yet
 
         # Select the closest valid frontier within min and max distance
@@ -116,13 +122,14 @@ class FrontierExplorer(Node):
         if goal_position is None:
             self.get_logger().info('No reachable and safe frontiers found within the specified distance range.')
             # Start the no-frontier timer if not already started
-            if not hasattr(self, 'no_frontier_timer') or self.no_frontier_timer is None:
+            if self.no_frontier_timer is None:
                 self.get_logger().info('Starting no-frontier timer.')
                 self.no_frontier_timer = self.create_timer(self.no_frontier_duration, self.no_frontier_timer_callback)
+            self.exploring = False  # Allow exploration to be re-triggered
             return  # Exit without stopping exploration yet
 
         # If we have a goal, cancel the no-frontier timer if running
-        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+        if self.no_frontier_timer is not None:
             self.no_frontier_timer.cancel()
             self.no_frontier_timer = None
             self.get_logger().info('Valid frontier selected. No-frontier timer cancelled.')
@@ -143,15 +150,14 @@ class FrontierExplorer(Node):
         )
         send_goal_future.add_done_callback(self.goal_response_callback)
 
-        # Start the movement monitoring timer
-        self.start_movement_monitoring()
+        # Movement monitoring will start after the goal is accepted
 
     def no_frontier_timer_callback(self):
         """
         Callback function for the no-frontier timer.
-        Stops exploration and shuts down the node after 10 seconds without frontiers.
+        Stops exploration and shuts down the node after the specified duration without frontiers.
         """
-        self.get_logger().info('The map is closed! No new frontiers detected for 10 seconds.')
+        self.get_logger().info('The map is closed! No new frontiers detected for 40 seconds.')
         self.stop_robot()
         self.shutdown()
 
@@ -163,8 +169,10 @@ class FrontierExplorer(Node):
         # Cancel any running timers
         if hasattr(self, 'movement_timer') and self.movement_timer is not None:
             self.movement_timer.cancel()
-        if hasattr(self, 'no_frontier_timer') and self.no_frontier_timer is not None:
+            self.get_logger().debug('Movement monitoring timer cancelled during shutdown.')
+        if self.no_frontier_timer is not None:
             self.no_frontier_timer.cancel()
+            self.get_logger().debug('No-frontier timer cancelled during shutdown.')
         # Destroy the node
         self.destroy_node()
         rclpy.shutdown()
@@ -175,6 +183,7 @@ class FrontierExplorer(Node):
         A frontier is a free cell adjacent to at least two unknown cells.
         """
         if self.map_data is None:
+            self.get_logger().warn('Map data is not available.')
             return []
 
         height, width = self.map_data.shape
@@ -201,8 +210,10 @@ class FrontierExplorer(Node):
         """
         Clusters frontier points using DBSCAN and filters out small clusters.
         Returns the centroids of valid clusters.
+        Also publishes markers for visualization in RViz.
         """
         if not frontiers:
+            self.get_logger().warn('No frontiers to cluster.')
             return []
 
         clustering = DBSCAN(eps=0.3, min_samples=5).fit(frontiers)  # min_samples increased to filter small clusters
@@ -232,6 +243,10 @@ class FrontierExplorer(Node):
             clustered_frontiers.append(point)
 
         self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
+
+        # Publish markers for visualization
+        self.publish_frontier_markers(clustered_frontiers)
+
         return clustered_frontiers
 
     def select_frontier(self, frontiers):
@@ -268,6 +283,7 @@ class FrontierExplorer(Node):
                 self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) is out of distance range.')
 
         if not valid_frontiers:
+            self.get_logger().info('No valid frontiers found after filtering.')
             return None
 
         # Select the frontier with the minimum distance
@@ -282,6 +298,7 @@ class FrontierExplorer(Node):
         Checks if the goal position is safe by ensuring there are no obstacles within the safety distance.
         """
         if self.map_info is None or self.map_data is None:
+            self.get_logger().warn('Map information or data is not available for safety check.')
             return False
 
         # Calculate the number of cells corresponding to the safety distance
@@ -375,10 +392,10 @@ class FrontierExplorer(Node):
         self.get_logger().info('Goal accepted :)')
         self.current_goal = goal_handle
 
-        # Cancel the goal timeout timer since the goal was accepted
-        if hasattr(self, 'goal_timer'):
-            self.goal_timer.cancel()
+        # Start movement monitoring only after the goal is accepted
+        self.start_movement_monitoring()
 
+        # Set up the result callback
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(self.get_result_callback)
 
@@ -404,6 +421,9 @@ class FrontierExplorer(Node):
         # Stop the movement monitoring timer
         self.stop_movement_monitoring()
 
+        # Reset exploring flag to allow new explorations
+        self.exploring = False
+
         # Look for the next frontier
         self.find_and_navigate_to_frontier()
 
@@ -418,6 +438,7 @@ class FrontierExplorer(Node):
             self.stop_robot()
         else:
             self.get_logger().info('Retrying with a new frontier.')
+            self.exploring = False  # Allow new exploration
             self.find_and_navigate_to_frontier()
 
     def feedback_callback(self, feedback_msg):
@@ -449,6 +470,27 @@ class FrontierExplorer(Node):
                 self.get_logger().info('No goals were cancelled.')
         except Exception as e:
             self.get_logger().error(f'Failed to cancel goal: {e}')
+            return  # Exit if cancellation failed
+
+        # Start looking for a new frontier after the goal is cancelled
+        self.find_and_navigate_to_frontier()
+
+    def cancel_current_goal(self):
+        """
+        Cancels the current navigation goal and resets exploration state.
+        """
+        if self.current_goal is not None:
+            try:
+                cancel_future = self.navigator.cancel_goal_async(self.current_goal)
+                cancel_future.add_done_callback(self.cancel_goal_response_callback)
+            except Exception as e:
+                self.get_logger().error(f'Failed to cancel goal: {e}')
+            self.current_goal = None
+            self.stop_robot()
+            self.stop_movement_monitoring()
+            # Reset movement monitoring variables
+            self.last_moving_position = None
+            self.last_moving_time = None
 
     def stop_robot(self):
         """
@@ -468,9 +510,15 @@ class FrontierExplorer(Node):
     def start_movement_monitoring(self):
         """
         Initializes movement monitoring by recording the current position and starting a timer.
+        Resets movement monitoring variables to prevent immediate retriggering.
         """
+        # Cancel any existing movement monitoring timer
+        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
+            self.movement_timer.cancel()
+            self.get_logger().debug('Existing movement monitoring timer cancelled.')
+
         self.last_moving_position = self.get_robot_pose()
-        self.last_moving_time = self.get_clock().now()
+        self.last_moving_time = None  # Will be set in check_movement_callback
         self.movement_timer = self.create_timer(self.movement_check_interval, self.check_movement_callback)
         self.get_logger().debug('Started movement monitoring.')
 
@@ -478,8 +526,9 @@ class FrontierExplorer(Node):
         """
         Stops the movement monitoring timer.
         """
-        if hasattr(self, 'movement_timer'):
+        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
             self.movement_timer.cancel()
+            self.movement_timer = None
             self.get_logger().debug('Stopped movement monitoring.')
 
     def check_movement_callback(self):
@@ -491,70 +540,39 @@ class FrontierExplorer(Node):
         if current_position is None or self.last_moving_position is None:
             return  # Can't get position
 
-        # Compute distance moved since last moving time
+        # Compute distance moved since last moving position
         dx = current_position.x - self.last_moving_position.x
         dy = current_position.y - self.last_moving_position.y
         distance_moved = math.hypot(dx, dy)
 
         if distance_moved >= self.movement_threshold:
-            # Robot has moved more than threshold, update last moving position and time
+            # Robot has moved more than threshold, update last moving position and reset last_moving_time
             self.last_moving_position = current_position
-            self.last_moving_time = current_time
+            self.last_moving_time = None  # Reset last_moving_time
             self.get_logger().debug('Robot has moved significantly.')
         else:
-            # Robot hasn't moved significantly
+            if self.last_moving_time is None:
+                # Robot hasn't moved, start timing
+                self.last_moving_time = current_time
+                self.get_logger().debug('Robot hasn\'t moved significantly. Starting movement timeout timer.')
+                return
+
+            # Calculate time since last significant movement
             time_since_last_move = (current_time - self.last_moving_time).nanoseconds / 1e9  # seconds
             self.get_logger().debug(f'Robot has not moved significantly for {time_since_last_move:.2f} seconds.')
+
             if time_since_last_move >= self.movement_timeout:
                 # Robot hasn't moved threshold distance in movement_timeout seconds, consider stuck
-                self.get_logger().warn('Robot is stuck, cancelling goal and sending a new one.')
+                self.get_logger().warn('Robot is stuck, cancelling goal.')
+                self.stop_movement_monitoring()
                 self.cancel_current_goal()
-                # Start looking for a new frontier
-                self.find_and_navigate_to_frontier()
+                # Exploration will be re-triggered in cancel_goal_response_callback()
 
-    def cancel_current_goal(self):
-        """
-        Cancels the current navigation goal and resets exploration state.
-        """
-        if self.current_goal is not None:
-            try:
-                cancel_future = self.navigator.cancel_goal_async(self.current_goal)
-                cancel_future.add_done_callback(self.cancel_goal_response_callback)
-            except Exception as e:
-                self.get_logger().error(f'Failed to cancel goal: {e}')
-            self.current_goal = None
-            self.exploring = False  # Allow retry
-            self.stop_robot()
-            self.stop_movement_monitoring()
-            # Reset movement monitoring variables
-            self.last_moving_position = None
-            self.last_moving_time = None
-
-    def check_map_closed_callback(self):
-        """
-        Periodically checks if no new frontiers have been detected for the specified duration.
-        If so, it logs a message and shuts down the node.
-        """
-        current_time = self.get_clock().now()
-        time_since_last_frontier = (current_time - self.last_frontier_time).nanoseconds / 1e9  # Convert to seconds
-
-        if time_since_last_frontier >= self.map_closed_duration:
-            self.get_logger().info('The map is closed! Shutting down the explorer node.')
-            self.stop_robot()
-            rclpy.shutdown()
-
-    def cancel_all_timers(self):
-        """
-        Cancels all active timers to ensure clean shutdown.
-        """
-        if hasattr(self, 'map_closed_timer'):
-            self.map_closed_timer.cancel()
-        if hasattr(self, 'movement_timer'):
-            self.movement_timer.cancel()
-        if hasattr(self, 'goal_timer'):
-            self.goal_timer.cancel()
-
+    # Visualization methods
     def publish_frontier_markers(self, frontiers):
+        """
+        Publishes frontier markers for visualization in RViz.
+        """
         marker_array = MarkerArray()
         for idx, frontier in enumerate(frontiers):
             marker = Marker()
@@ -575,18 +593,24 @@ class FrontierExplorer(Node):
             marker.color.b = 0.0
             marker_array.markers.append(marker)
         self.marker_publisher.publish(marker_array)
-        
+        self.get_logger().debug('Published frontier markers for RViz.')
+
+
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
+
+    # Use a MultiThreadedExecutor to allow timers and callbacks to run in parallel
+    executor = rclpy.executors.MultiThreadedExecutor()
     try:
-        rclpy.spin(explorer)
+        rclpy.spin(explorer, executor=executor)
     except KeyboardInterrupt:
         explorer.get_logger().info('Keyboard interrupt, shutting down.')
         explorer.shutdown()
     finally:
         if rclpy.ok():
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
