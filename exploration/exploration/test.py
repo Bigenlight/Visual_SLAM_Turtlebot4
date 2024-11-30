@@ -146,7 +146,7 @@ class FrontierExplorer(Node):
         # 네비게이션 목표 메시지 생성
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = PoseStamped()
-        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.frame_id = 'odom'  # 'map'에서 'odom'으로 변경
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position = goal_position
         goal_msg.pose.pose.orientation.w = 1.0  # 앞으로 향하도록 설정
@@ -180,8 +180,8 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
 
-        # 임계값 설정 (예: 접근 가능한 미지 영역이 0.1% 미만일 때 탐색 완료로 판단)
-        if accessible_unknown_ratio < 0.001:
+        # 임계값 설정 (예: 접근 가능한 미지 영역이 1% 미만일 때 탐색 완료로 판단)
+        if accessible_unknown_ratio < 0.01:
             return True
         else:
             return False
@@ -401,10 +401,10 @@ class FrontierExplorer(Node):
 
     def get_robot_pose(self):
         """
-        로봇의 현재 위치를 맵 프레임에서 가져옵니다.
+        로봇의 현재 위치를 'odom' 프레임에서 가져옵니다.
         """
         try:
-            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            trans = self.tf_buffer.lookup_transform('odom', 'base_link', rclpy.time.Time())
             self.get_logger().debug(f'로봇 위치: ({trans.transform.translation.x:.2f}, {trans.transform.translation.y:.2f})')
             return trans.transform.translation
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
@@ -622,7 +622,7 @@ class FrontierExplorer(Node):
         marker_array = MarkerArray()
         for idx, frontier in enumerate(frontiers):
             marker = Marker()
-            marker.header.frame_id = 'map'
+            marker.header.frame_id = 'odom'  # 'map'에서 'odom'으로 변경
             marker.header.stamp = self.get_clock().now().to_msg()
             marker.ns = 'frontiers'
             marker.id = idx
