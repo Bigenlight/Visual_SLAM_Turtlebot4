@@ -45,7 +45,7 @@ class FrontierExplorer(Node):
 
         # No-frontier timer variables
         self.no_frontier_timer = None
-        self.no_frontier_duration = 20.0  # 10 seconds without frontiers
+        self.no_frontier_duration = 60.0  # 10 seconds without frontiers
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
