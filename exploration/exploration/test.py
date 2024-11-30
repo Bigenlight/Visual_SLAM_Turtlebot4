@@ -31,8 +31,8 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
-        self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
+        self.max_frontier_distance = 4.0  # 최대 탐사 거리 (미터)
+        self.min_frontier_distance = 0.41  # 최소 목표 거리 (미터, 허용 오차)
         self.safety_distance = 0.1  # 안전 거리 (미터)
         self.max_retries = 3  # 최대 목표 재시도 횟수
         self.retry_count = 0

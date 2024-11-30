@@ -9,6 +9,7 @@ import numpy as np
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 import math
 from sklearn.cluster import DBSCAN
+from visualization_msgs.msg import Marker, MarkerArray
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -30,7 +31,7 @@ class FrontierExplorer(Node):
         self.current_goal = None
         self.exploring = False
         self.max_frontier_distance = 20.0  # Maximum exploration distance in meters
-        self.min_frontier_distance = 0.36  # Minimum goal distance in meters (tolerance)
+        self.min_frontier_distance = 0.41  # Minimum goal distance in meters (tolerance)
         self.safety_distance = 0.1  # Safety distance in meters
         self.max_retries = 3  # Maximum number of goal retries
         self.retry_count = 0
@@ -62,6 +63,8 @@ class FrontierExplorer(Node):
         # Initialize visited frontiers list
         self.visited_frontiers = []
         self.frontier_distance_threshold = 0.1  # 25 cm to consider a frontier as visited
+
+        self.marker_publisher = self.create_publisher(MarkerArray, 'frontier_markers', 10)
 
     def map_callback(self, msg):
         """
@@ -551,6 +554,28 @@ class FrontierExplorer(Node):
         if hasattr(self, 'goal_timer'):
             self.goal_timer.cancel()
 
+    def publish_frontier_markers(self, frontiers):
+        marker_array = MarkerArray()
+        for idx, frontier in enumerate(frontiers):
+            marker = Marker()
+            marker.header.frame_id = 'map'
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = 'frontiers'
+            marker.id = idx
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position = frontier
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.2
+            marker.scale.y = 0.2
+            marker.scale.z = 0.2
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker_array.markers.append(marker)
+        self.marker_publisher.publish(marker_array)
+        
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
