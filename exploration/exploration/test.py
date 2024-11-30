@@ -1,558 +1,542 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped, Point, Quaternion, Twist
+from geometry_msgs.msg import PoseStamped, Point, Twist
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import SaveMap
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 import numpy as np
-from tf2_ros import Buffer, TransformListener
-import tf2_ros
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 import math
-from rclpy.duration import Duration
-import scipy.ndimage
 from sklearn.cluster import DBSCAN
-from visualization_msgs.msg import Marker, MarkerArray
-import os
-import json
-import datetime
+from std_msgs.msg import String
 
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
 
-        # 맵 구독자 설정
+        # Set logging level to DEBUG for detailed logs
+        self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
+
+        # Subscription to the /map topic
         self.map_subscriber = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10)
 
-        # NavigateToPose 액션 클라이언트 설정
+        # ActionClient for NavigateToPose
         self.navigator = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # 초기 변수 설정
+        # Initialize variables
         self.map_data = None
         self.map_info = None
+        self.current_goal = None
         self.exploring = False
-        self.waypoints = []
-        self.current_waypoint_index = 0
-        self.goal_handle = None
+        self.max_frontier_distance = 20.0  # Maximum exploration distance in meters
+        self.min_frontier_distance = 0.36  # Minimum goal distance in meters (tolerance)
+        self.safety_distance = 0.1  # Safety distance in meters
+        self.max_retries = 3  # Maximum number of goal retries
+        self.retry_count = 0
+        self.goal_timeout = 30.0  # Goal reach timeout in seconds
 
-        # TF 리스너 설정
+        # Movement monitoring variables
+        self.last_moving_position = None
+        self.last_moving_time = None
+        self.movement_check_interval = 1.0  # Check every 1 second
+        self.movement_threshold = 0.10  # 10 cm
+        self.movement_timeout = 3.0  # 3 seconds without movement
+
+        # Publisher to cmd_vel to stop the robot
+        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        # Publisher to the 'cleaning' topic to signal the next phase
+        self.cleaning_publisher = self.create_publisher(String, 'cleaning', 10)
+
+        # TF2 Buffer and Listener
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # 액션 서버 대기
-        self.get_logger().info('Waiting for navigate_to_pose action server...')
+        # Wait for the action server to be ready
+        self.get_logger().info('Waiting for NavigateToPose action server...')
         self.navigator.wait_for_server()
-        self.get_logger().info('Action server available.')
+        self.get_logger().info('NavigateToPose action server ready.')
 
-        # 파라미터 선언 및 초기화
-        self.declare_parameter('safe_distance', 0.2)  # 안전 거리 조정
-        self.safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
+        # Service client to save the map
+        self.save_map_client = self.create_client(SaveMap, 'save_map')
+        self.get_logger().info('Waiting for save_map service...')
+        self.save_map_client.wait_for_service()
+        self.get_logger().info('save_map service available.')
 
-        self.declare_parameter('recovery_behavior_enabled', True)
-        self.recovery_behavior_enabled = self.get_parameter('recovery_behavior_enabled').get_parameter_value().bool_value
-
-        self.declare_parameter('stuck_timeout', 4.0)  # 4초 동안 같은 위치에 머물러 있으면 스턱으로 간주
-        self.stuck_timeout = self.get_parameter('stuck_timeout').get_parameter_value().double_value
-
-        self.declare_parameter('waypoint_spacing', 0.5)  # 웨이포인트 간격을 0.5미터로 설정
-        self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
-
-        self.declare_parameter('max_waypoint_distance', 1.0)  # 최대 웨이포인트 거리 기준 설정
-        self.max_waypoint_distance = self.get_parameter('max_waypoint_distance').get_parameter_value().double_value
-
-        self.declare_parameter('robot_width', 0.33)
-        self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
-
-        self.declare_parameter('map_save_directory', '/tmp/maps')  # 맵 저장 디렉토리
-        self.map_save_directory = self.get_parameter('map_save_directory').get_parameter_value().string_value
-        os.makedirs(self.map_save_directory, exist_ok=True)
-
-        # 추가된 파라미터: 위치 변화 임계값
-        self.declare_parameter('position_epsilon', 0.05)  # 위치 변화 임계값 (미터 단위)
-        self.position_epsilon = self.get_parameter('position_epsilon').get_parameter_value().double_value
-
-        # cmd_vel 퍼블리셔 설정 (회복 행동용)
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-
-        # 웨이포인트 마커 퍼블리셔 설정
-        self.marker_pub = self.create_publisher(MarkerArray, 'waypoints_markers', 10)
-
-        # 현재 목표 상태 추적
-        self.current_goal_active = False
-
-        # 로봇의 마지막 위치 및 시간 추적
-        self.last_pose = None
-        self.last_movement_time = self.get_clock().now()
-        self.stuck = False
-
-        # 로봇 이동 모니터링을 위한 타이머 설정 (1초 간격)
-        self.timer = self.create_timer(1.0, self.monitor_robot_movement)
+        # Initialize visited frontiers list
+        self.visited_frontiers = []
+        self.frontier_distance_threshold = 0.25  # 25 cm to consider a frontier as visited
 
     def map_callback(self, msg):
-        # OccupancyGrid 데이터를 NumPy 배열로 변환
+        """
+        Callback function for the /map topic.
+        Updates the map data and initiates exploration if not already exploring.
+        """
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
         self.map_info = msg.info
 
-        # 맵 데이터를 파일로 저장
-        self.save_map_to_file(msg)
-
-        # 탐색되지 않은 영역이 남아있는지 확인
-        unknown = self.map_data == -1
-        if not np.any(unknown):
-            if self.exploring:
-                self.get_logger().info('Exploration complete! All areas have been explored.')
-                self.exploring = False
-                self.shutdown_node()
-            else:
-                self.get_logger().info('Map is fully explored.')
-            return
-
-        if not self.exploring and not self.current_goal_active:
+        if not self.exploring:
             self.exploring = True
-            self.plan_and_execute_exploration()
+            self.find_and_navigate_to_frontier()
 
-    def plan_and_execute_exploration(self):
-        # 탐색 전선 검출
+    def find_and_navigate_to_frontier(self):
+        """
+        Detects frontiers, clusters them, selects a valid frontier, and sends a navigation goal.
+        """
+        # Frontier detection logic
         frontiers = self.detect_frontiers()
-        if frontiers is None or frontiers.size == 0:
-            self.get_logger().info('No frontiers detected. Waiting for map updates...')
-            self.exploring = False  # 다음 맵 업데이트에서 다시 탐색 시도
-            return
 
-        # 웨이포인트 생성
-        waypoints = self.generate_waypoints(frontiers)
-        if waypoints:
-            self.waypoints = waypoints
-            self.current_waypoint_index = 0
-            self.send_next_waypoint()
-        else:
-            self.get_logger().info('No valid waypoints found. Waiting for map updates...')
-            self.exploring = False
-            return
+        if not frontiers:
+            self.get_logger().info('No frontiers detected. Mapping complete.')
+            self.mapping_complete()
+            return  # Exit exploration
+
+        # Cluster the frontiers
+        clustered_frontiers = self.cluster_frontiers(frontiers)
+
+        if not clustered_frontiers:
+            self.get_logger().info('No valid frontiers after clustering. Mapping complete.')
+            self.mapping_complete()
+            return  # Exit exploration
+
+        # Select the closest valid frontier within min and max distance
+        goal_position = self.select_frontier(clustered_frontiers)
+
+        if goal_position is None:
+            self.get_logger().info('No reachable and safe frontiers found within the specified distance range. Mapping complete.')
+            self.mapping_complete()
+            return  # Exit exploration
+
+        # Create and send a navigation goal
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position = goal_position
+        goal_msg.pose.pose.orientation.w = 1.0  # Facing forward
+
+        self.get_logger().info(f'Navigating to frontier at ({goal_position.x:.2f}, {goal_position.y:.2f})')
+
+        send_goal_future = self.navigator.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        send_goal_future.add_done_callback(self.goal_response_callback)
+
+        # Start the movement monitoring timer
+        self.start_movement_monitoring()
+
+    def mapping_complete(self):
+        """
+        Handles actions to perform when mapping is complete.
+        """
+        self.get_logger().info('Mapping complete. Saving the map and notifying cleaning node.')
+        # Stop the robot
+        self.stop_robot()
+        # Save the map
+        self.save_map()
+        # Publish to cleaning topic
+        self.publish_cleaning_signal()
+        # Shutdown the node
+        self.shutdown()
+
+    def save_map(self):
+        """
+        Calls the save_map service to save the map to the specified path.
+        """
+        save_map_request = SaveMap.Request()
+        save_map_request.map_topic = 'map'
+        save_map_request.map_url = '/home/rokey/4_ws/src/map/map'  # The base name of the map file
+        save_map_request.image_format = 'pgm'
+        save_map_request.map_mode = 'trinary'
+        save_map_request.free_thresh = 0.25
+        save_map_request.occupied_thresh = 0.65
+
+        future = self.save_map_client.call_async(save_map_request)
+        future.add_done_callback(self.save_map_response_callback)
+
+    def save_map_response_callback(self, future):
+        try:
+            response = future.result()
+            self.get_logger().info(f'Map saved successfully at {response.result}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to save map: {e}')
+
+    def publish_cleaning_signal(self):
+        """
+        Publishes a message to the 'cleaning' topic to signal the next cleaning algorithm to start.
+        """
+        msg = String()
+        msg.data = 'start_cleaning'
+        self.cleaning_publisher.publish(msg)
+        self.get_logger().info('Published cleaning signal.')
+
+    def shutdown(self):
+        """
+        Stops exploration and shuts down the node gracefully.
+        """
+        self.get_logger().info('Shutting down the exploration node.')
+        # Cancel any running timers
+        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
+            self.movement_timer.cancel()
+        # Destroy the node
+        self.destroy_node()
+        rclpy.shutdown()
 
     def detect_frontiers(self):
-        # 맵 데이터에서 탐색 전선 검출
-        occupied = self.map_data == 100
-        free = self.map_data == 0
-        unknown = self.map_data == -1
-
-        # 알려진 공간과 미탐색 공간의 경계 찾기
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        unknown_dilated = scipy.ndimage.binary_dilation(unknown, structure=kernel)
-        border = unknown_dilated & free
-
-        # 탐색 전선의 좌표 추출
-        frontiers = np.argwhere(border)
-        self.get_logger().info(f'Number of frontier points detected: {len(frontiers)}')
-
-        return frontiers
-
-    def generate_waypoints(self, frontiers):
-        # 좌표 변환 (x, y)
-        points = frontiers[:, [1, 0]].astype(float)  # x, y 순서로 변경
-        points = points * self.map_info.resolution + np.array([self.map_info.origin.position.x, self.map_info.origin.position.y])
-
-        if points.size == 0:
-            self.get_logger().warning('No points available for clustering.')
+        """
+        Detects frontier points in the map.
+        A frontier is a free cell adjacent to at least two unknown cells.
+        """
+        if self.map_data is None:
             return []
 
-        # 클러스터링 적용
-        clustering = DBSCAN(eps=self.waypoint_spacing, min_samples=3).fit(points)
-        cluster_centers = []
-        for cluster_label in np.unique(clustering.labels_):
-            if cluster_label == -1:
-                continue  # 노이즈 제거
-            cluster_points = points[clustering.labels_ == cluster_label]
+        height, width = self.map_data.shape
+        frontier_points = []
 
-            # 양쪽에 벽이 있는 경계선만 선택
-            valid_frontier = self.filter_frontier_with_walls(cluster_points)
-            if valid_frontier is not None:
-                cluster_centers.append(valid_frontier)
+        # Iterate over all free cells
+        free_cells = np.argwhere(self.map_data == 0)
 
-        if not cluster_centers:
-            self.get_logger().warning('No valid clusters found for frontiers.')
+        for cell in free_cells:
+            y, x = cell
+            neighbors = self.get_neighbors(x, y)
+            unknown_neighbors = 0
+            for nx, ny in neighbors:
+                if self.map_data[ny, nx] == -1:
+                    unknown_neighbors += 1
+            if unknown_neighbors >= 2:  # Require at least two unknown neighbors
+                mx, my = self.grid_to_map(x, y)
+                frontier_points.append([mx, my])
+
+        self.get_logger().info(f'Detected {len(frontier_points)} frontier points.')
+        return frontier_points
+
+    def cluster_frontiers(self, frontiers):
+        """
+        Clusters frontier points using DBSCAN and filters out small clusters.
+        Returns the centroids of valid clusters.
+        """
+        if not frontiers:
             return []
 
-        # 웨이포인트 생성
-        waypoints = []
-        for center in cluster_centers:
-            if self.is_safe_point(center[0], center[1]):
-                waypoints.append(Point(x=center[0], y=center[1], z=0.0))
-            else:
-                self.get_logger().debug(f'Waypoint at ({center[0]:.2f}, {center[1]:.2f}) is not safe.')
+        clustering = DBSCAN(eps=0.5, min_samples=5).fit(frontiers)  # min_samples increased to filter small clusters
+        labels = clustering.labels_
 
-        # 웨이포인트 시각화
-        self.visualize_waypoints(waypoints)
+        unique_labels = set(labels)
+        clustered_frontiers = []
 
-        self.get_logger().info(f'Generated {len(waypoints)} waypoints for exploration.')
-        return waypoints
+        min_cluster_size = 5  # Minimum number of points in a cluster
 
-    def filter_frontier_with_walls(self, cluster_points):
-        """
-        클러스터 내의 포인트 중 양쪽에 벽이 있는 경계선의 중심을 찾습니다.
-        """
-        for point in cluster_points:
-            x_idx = int((point[0] - self.map_info.origin.position.x) / self.map_info.resolution)
-            y_idx = int((point[1] - self.map_info.origin.position.y) / self.map_info.resolution)
+        for label in unique_labels:
+            if label == -1:
+                # Noise points; exclude them
+                continue
+            indices = np.where(labels == label)[0]
+            cluster = np.array(frontiers)[indices]
+            cluster_size = len(cluster)
 
-            # 맵 인덱스가 유효한지 확인
-            if x_idx < 1 or x_idx >= self.map_info.width - 1 or y_idx < 1 or y_idx >= self.map_info.height - 1:
+            # Filter out clusters that are too small
+            if cluster_size < min_cluster_size:
+                self.get_logger().debug(f'Ignoring small cluster with label {label} of size {cluster_size}')
                 continue
 
-            # 상하좌우 검사하여 양쪽에 벽이 있는지 확인
-            neighbors = self.map_data[y_idx - 1:y_idx + 2, x_idx - 1:x_idx + 2].flatten()
-            counts = np.bincount(neighbors + 1)  # -1, 0, 100을 0, 1, 2로 변환
-            unknown_count = counts[0] if len(counts) > 0 else 0
-            free_count = counts[1] if len(counts) > 1 else 0
-            occupied_count = counts[2] if len(counts) > 2 else 0
+            # Compute the centroid of the cluster
+            centroid = np.mean(cluster, axis=0)
+            point = Point(x=centroid[0], y=centroid[1], z=0.0)
+            clustered_frontiers.append(point)
 
-            # 주변에 벽(occupied)이 두 개 이상 있고, 자유 공간(free)이 하나 이상이면 유효한 프런티어로 간주
-            if occupied_count >= 2 and free_count >= 1:
-                return point  # 해당 포인트를 반환
+        self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
+        return clustered_frontiers
 
-        return None
+    def select_frontier(self, frontiers):
+        """
+        Selects the closest valid frontier that hasn't been visited and is safe.
+        """
+        robot_position = self.get_robot_pose()
+        if robot_position is None:
+            self.get_logger().warning('Could not get robot position. Selecting the first frontier.')
+            return frontiers[0] if frontiers else None
 
-    def is_safe_point(self, x_world, y_world):
-        # 월드 좌표를 맵 인덱스로 변환
-        x_idx = int((x_world - self.map_info.origin.position.x) / self.map_info.resolution)
-        y_idx = int((y_world - self.map_info.origin.position.y) / self.map_info.resolution)
+        valid_frontiers = []
+        distances = []
+        for frontier in frontiers:
+            # Check if this frontier has been visited
+            if self.is_frontier_visited(frontier):
+                self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) has already been visited.')
+                continue
 
-        # 맵 인덱스가 유효한지 확인
-        if x_idx < 0 or x_idx >= self.map_info.width or y_idx < 0 or y_idx >= self.map_info.height:
-            return False
+            dx = frontier.x - robot_position.x
+            dy = frontier.y - robot_position.y
+            distance = math.hypot(dx, dy)
+            self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
 
-        # 해당 위치가 자유 공간인지 확인
-        if self.map_data[y_idx, x_idx] != 0:
-            return False
-
-        # 거리 변환(Distance Transform)을 이용하여 주변 장애물과의 거리 확인
-        occupied = self.map_data == 100
-        distance_map = scipy.ndimage.distance_transform_edt(~occupied) * self.map_info.resolution
-        distance = distance_map[y_idx, x_idx]
-
-        return distance >= self.safe_distance
-
-    def visualize_waypoints(self, waypoints):
-        marker_array = MarkerArray()
-        for idx, wp in enumerate(waypoints):
-            marker = Marker()
-            marker.header.frame_id = 'map'
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = 'waypoints'
-            marker.id = idx
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position = wp
-            marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-            marker.scale.x = 0.2
-            marker.scale.y = 0.2
-            marker.scale.z = 0.2
-            marker.color.a = 1.0
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-            marker_array.markers.append(marker)
-
-        self.marker_pub.publish(marker_array)
-
-    def send_next_waypoint(self):
-        if self.current_waypoint_index < len(self.waypoints):
-            target_waypoint = self.waypoints[self.current_waypoint_index]
-
-            current_pose = self.get_robot_pose()
-            if current_pose is None:
-                self.get_logger().warn('Cannot get robot pose. Skipping waypoint.')
-                self.current_waypoint_index += 1
-                self.send_next_waypoint()
-                return
-
-            # 현재 위치와 목표 웨이포인트 간의 거리 계산
-            dx = target_waypoint.x - current_pose.x
-            dy = target_waypoint.y - current_pose.y
-            distance = math.sqrt(dx**2 + dy**2)
-
-            # 웨이포인트가 최대 거리보다 멀면 0.5m 간격으로 분할
-            if distance > self.max_waypoint_distance:
-                new_waypoints = self.split_waypoint(current_pose, target_waypoint, step=0.5)
-                if new_waypoints:
-                    # 현재 웨이포인트를 분할된 웨이포인트로 대체
-                    self.waypoints = self.waypoints[:self.current_waypoint_index] + new_waypoints + self.waypoints[self.current_waypoint_index + 1:]
-                    self.get_logger().info(f'Waypoint too far ({distance:.2f}m). Splitting into {len(new_waypoints)} smaller waypoints.')
-                self.send_next_waypoint()
-                return
-
-            # 웨이포인트가 0.5m를 초과하면 0.5m 간격으로 분할
-            elif distance > self.waypoint_spacing:
-                new_waypoints = self.split_waypoint(current_pose, target_waypoint, step=self.waypoint_spacing)
-                if new_waypoints:
-                    # 현재 웨이포인트를 분할된 웨이포인트로 대체
-                    self.waypoints = self.waypoints[:self.current_waypoint_index] + new_waypoints + self.waypoints[self.current_waypoint_index + 1:]
-                    self.get_logger().info(f'Waypoint too far ({distance:.2f}m). Splitting into {len(new_waypoints)} smaller waypoints.')
-                self.send_next_waypoint()
-                return
-
-            # 웨이포인트가 적절한 거리면 목표 전송
-            goal_pose = self.create_pose_stamped(target_waypoint)
-            self.get_logger().info(f'Sending goal to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} at ({target_waypoint.x:.2f}, {target_waypoint.y:.2f})')
-            self.send_goal(goal_pose)
-        else:
-            self.get_logger().info('All current waypoints have been processed. Checking for new frontiers...')
-            self.exploring = False
-            # 새로운 맵 업데이트를 기다리기 위해 노드를 종료하지 않고 맵 콜백에서 다시 탐색 시도
-            # 즉, map_callback이 다시 호출될 때 plan_and_execute_exploration()이 실행됨
-
-    def send_goal(self, goal_pose):
-        if not self.navigator.server_is_ready():
-            self.get_logger().error('Action server is not ready. Cannot send goal.')
-            return
-
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = goal_pose
-
-        self.get_logger().info('Sending goal to the action server.')
-        send_goal_future = self.navigator.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
-        send_goal_future.add_done_callback(self.goal_response_callback)
-        self.current_goal_active = True
-
-    def goal_response_callback(self, future):
-        try:
-            goal_handle = future.result()
-            if not goal_handle.accepted:
-                self.get_logger().warning('Goal rejected by the action server.')
-                self.current_goal_active = False
-                self.current_waypoint_index += 1
-                self.send_next_waypoint()
-                return
-
-            self.get_logger().info('Goal accepted by the action server.')
-            self.goal_handle = goal_handle
-            self.goal_handle.get_result_async().add_done_callback(self.get_result_callback)
-        except Exception as e:
-            self.get_logger().error(f'Exception in goal_response_callback: {e}')
-            self.current_goal_active = False
-            self.current_waypoint_index += 1
-            self.send_next_waypoint()
-
-    def get_result_callback(self, future):
-        try:
-            result = future.result().result
-            status = future.result().status
-
-            if status == GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().info('Waypoint reached successfully!')
+            if self.min_frontier_distance <= distance <= self.max_frontier_distance:
+                # Check if the goal is safe
+                is_safe = self.is_goal_safe(frontier.x, frontier.y, self.safety_distance)
+                self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) is within distance range and safety check result: {is_safe}')
+                if is_safe:
+                    valid_frontiers.append(frontier)
+                    distances.append(distance)
+                    self.get_logger().info(f'Valid frontier at ({frontier.x:.2f}, {frontier.y:.2f}), distance: {distance:.2f}m')
             else:
-                self.get_logger().warning(f'Failed to reach waypoint. Status: {status}')
-        except Exception as e:
-            self.get_logger().error(f'Error in get_result_callback: {e}')
+                self.get_logger().debug(f'Frontier at ({frontier.x:.2f}, {frontier.y:.2f}) is out of distance range.')
 
-        # 다음 웨이포인트로 이동
-        self.current_goal_active = False
-        self.current_waypoint_index += 1
-        self.send_next_waypoint()
-
-    def perform_recovery_behavior(self):
-        self.get_logger().info('Performing recovery behavior.')
-        # 현재 목표가 활성화되어 있다면 취소
-        if self.goal_handle is not None:
-            self.get_logger().info('Cancelling current goal due to being stuck.')
-            try:
-                cancel_future = self.goal_handle.cancel_goal_async()
-                cancel_future.add_done_callback(self.cancel_goal_callback)
-            except AttributeError as e:
-                self.get_logger().error(f'Error cancelling goal: {e}')
-                self.get_logger().info('Skipping goal cancellation and performing recovery.')
-                self.rotate_in_place()
-                self.get_logger().info('Recovery behavior completed.')
-                self.send_next_waypoint()
-        else:
-            # 목표가 없다면 회전 후 다음 웨이포인트 시도
-            self.rotate_in_place()
-            self.get_logger().info('Recovery behavior completed.')
-            self.send_next_waypoint()
-
-    def cancel_goal_callback(self, future):
-        cancel_response = future.result()
-        if len(cancel_response.goals_canceling) > 0:
-            self.get_logger().info('Current goal successfully canceled.')
-        else:
-            self.get_logger().warning('Failed to cancel current goal.')
-
-        self.goal_handle = None
-        self.current_goal_active = False
-        self.send_next_waypoint()
-
-    def rotate_in_place(self):
-        # 제자리에서 회전하여 장애물 회피 시도
-        twist = Twist()
-        twist.angular.z = 0.5  # 시계방향으로 0.5 rad/s 회전
-        duration = 2.0  # 2초 동안 회전
-        start_time = self.get_clock().now()
-        self.get_logger().info('Rotating in place for recovery.')
-
-        while (self.get_clock().now() - start_time).nanoseconds < duration * 1e9:
-            self.cmd_vel_pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.1)
-
-        # 회전 정지
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
-        self.get_logger().info('Rotation complete.')
-
-    def create_pose_stamped(self, position):
-        pose = PoseStamped()
-        pose.header.frame_id = 'map'
-        pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position = position
-
-        # 로봇이 웨이포인트를 향하도록 방향 설정
-        robot_pose = self.get_robot_pose()
-        if robot_pose is not None:
-            dx = position.x - robot_pose.x
-            dy = position.y - robot_pose.y
-            yaw = math.atan2(dy, dx)
-            quaternion = self.euler_to_quaternion(0, 0, yaw)
-            pose.pose.orientation = quaternion
-        else:
-            # 기본 방향 설정
-            pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-
-        return pose
-
-    def euler_to_quaternion(self, roll, pitch, yaw):
-        qx = math.sin(roll / 2) * math.cos(pitch / 2) * math.cos(yaw / 2) - \
-             math.cos(roll / 2) * math.sin(pitch / 2) * math.sin(yaw / 2)
-        qy = math.cos(roll / 2) * math.sin(pitch / 2) * math.cos(yaw / 2) + \
-             math.sin(roll / 2) * math.cos(pitch / 2) * math.sin(yaw / 2)
-        qz = math.cos(roll / 2) * math.cos(pitch / 2) * math.sin(yaw / 2) - \
-             math.sin(roll / 2) * math.sin(pitch / 2) * math.cos(yaw / 2)
-        qw = math.cos(roll / 2) * math.cos(pitch / 2) * math.cos(yaw / 2) + \
-             math.sin(roll / 2) * math.sin(pitch / 2) * math.sin(yaw / 2)
-        return Quaternion(x=qx, y=qy, z=qz, w=qw)
-
-    def get_robot_pose(self):
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                'map',
-                'base_link',
-                rclpy.time.Time(),
-                timeout=Duration(seconds=1.0))
-            return trans.transform.translation
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
-            self.get_logger().warning(f'Could not get robot pose in map frame: {e}')
+        if not valid_frontiers:
             return None
 
-    def feedback_callback(self, feedback_msg):
-        # 피드백 처리 가능 (현재는 생략)
-        pass
+        # Select the frontier with the minimum distance
+        min_index = np.argmin(distances)
+        selected_frontier = valid_frontiers[min_index]
+        self.visited_frontiers.append(selected_frontier)  # Add to visited frontiers
+        self.get_logger().info(f'Selected frontier at ({selected_frontier.x:.2f}, {selected_frontier.y:.2f})')
+        return selected_frontier
 
-    def shutdown_node(self):
-        # 노드가 안전하게 종료되도록 처리
-        if rclpy.ok():
-            self.get_logger().info('Shutting down the node safely.')
-            self.destroy_node()
-            rclpy.shutdown()
+    def is_goal_safe(self, goal_x, goal_y, safety_distance=0.5):
+        """
+        Checks if the goal position is safe by ensuring there are no obstacles within the safety distance.
+        """
+        if self.map_info is None or self.map_data is None:
+            return False
 
-    def save_map_to_file(self, map_msg):
-        # 맵 데이터를 JSON 파일로 저장
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        map_filename = os.path.join(self.map_save_directory, f'map_{timestamp}.json')
-        map_dict = {
-            'header': {
-                'stamp': {
-                    'sec': map_msg.header.stamp.sec,
-                    'nanosec': map_msg.header.stamp.nanosec
-                },
-                'frame_id': map_msg.header.frame_id
-            },
-            'info': {
-                'map_load_time': {
-                    'sec': map_msg.info.map_load_time.sec,
-                    'nanosec': map_msg.info.map_load_time.nanosec
-                },
-                'resolution': map_msg.info.resolution,
-                'width': map_msg.info.width,
-                'height': map_msg.info.height,
-                'origin': {
-                    'position': {
-                        'x': map_msg.info.origin.position.x,
-                        'y': map_msg.info.origin.position.y,
-                        'z': map_msg.info.origin.position.z
-                    },
-                    'orientation': {
-                        'x': map_msg.info.origin.orientation.x,
-                        'y': map_msg.info.origin.orientation.y,
-                        'z': map_msg.info.origin.orientation.z,
-                        'w': map_msg.info.origin.orientation.w
-                    }
-                }
-            },
-            'data': map_msg.data.tolist()
-        }
+        # Calculate the number of cells corresponding to the safety distance
+        num_cells = int(math.ceil(safety_distance / self.map_info.resolution))
 
+        # Convert goal position to grid coordinates
+        goal_grid_x = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
+        goal_grid_y = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
+
+        # Define the grid range to check
+        min_x = max(goal_grid_x - num_cells, 0)
+        max_x = min(goal_grid_x + num_cells, self.map_data.shape[1] - 1)
+        min_y = max(goal_grid_y - num_cells, 0)
+        max_y = min(goal_grid_y + num_cells, self.map_data.shape[0] - 1)
+
+        # Check each cell within the safety distance
+        for y in range(min_y, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                cell_value = self.map_data[y, x]
+                if cell_value > 50:  # Threshold for obstacle, adjust as needed
+                    self.get_logger().debug(f'Obstacle found at grid ({x}, {y}) with value {cell_value}')
+                    return False
+        self.get_logger().debug(f'Goal at ({goal_x:.2f}, {goal_y:.2f}) is safe.')
+        return True
+
+    def get_neighbors(self, x, y):
+        """
+        Returns the 8-connected neighbors of a given cell.
+        """
+        neighbors = []
+        width = self.map_data.shape[1]
+        height = self.map_data.shape[0]
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                nx = x + dx
+                ny = y + dy
+                if (dx != 0 or dy != 0) and 0 <= nx < width and 0 <= ny < height:
+                    neighbors.append((nx, ny))
+        return neighbors
+
+    def grid_to_map(self, x, y):
+        """
+        Converts grid coordinates to map coordinates.
+        """
+        mx = self.map_info.origin.position.x + (x + 0.5) * self.map_info.resolution
+        my = self.map_info.origin.position.y + (y + 0.5) * self.map_info.resolution
+        return mx, my
+
+    def get_robot_pose(self):
+        """
+        Retrieves the robot's current pose in the map frame.
+        """
         try:
-            with open(map_filename, 'w') as f:
-                json.dump(map_dict, f, indent=4)
-            self.get_logger().info(f'Map saved to {map_filename}')
-        except Exception as e:
-            self.get_logger().error(f'Failed to save map to file: {e}')
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            self.get_logger().debug(f'Robot position: ({trans.transform.translation.x:.2f}, {trans.transform.translation.y:.2f})')
+            return trans.transform.translation
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().error(f'Could not get robot pose: {e}')
+            return None
 
-    def monitor_robot_movement(self):
-        current_pose = self.get_robot_pose()
-        if current_pose is None:
+    def is_frontier_visited(self, frontier):
+        """
+        Checks if a frontier has already been visited based on the distance threshold.
+        """
+        for visited in self.visited_frontiers:
+            dx = frontier.x - visited.x
+            dy = frontier.y - visited.y
+            distance = math.hypot(dx, dy)
+            if distance < self.frontier_distance_threshold:
+                return True
+        return False
+
+    def goal_response_callback(self, future):
+        """
+        Callback for handling the response from the action server after sending a goal.
+        """
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self.get_logger().error(f'Goal failed to reach server: {e}')
+            self.exploring = False
+            self.stop_robot()
             return
 
-        if self.last_pose is not None:
-            dx = current_pose.x - self.last_pose.x
-            dy = current_pose.y - self.last_pose.y
-            distance = math.sqrt(dx**2 + dy**2)
+        if not goal_handle.accepted:
+            self.get_logger().info('Goal rejected :(')
+            self.exploring = False
+            self.stop_robot()
+            return
 
-            if distance > self.position_epsilon:
-                # 로봇이 위치를 변경했을 경우
-                self.last_movement_time = self.get_clock().now()
-                self.stuck = False
-                self.get_logger().debug(f'Robot moved {distance:.2f}m, resetting stuck timer.')
-            else:
-                # 로봇이 거의 움직이지 않았을 경우
-                elapsed = (self.get_clock().now() - self.last_movement_time).nanoseconds / 1e9
-                self.get_logger().debug(f'Robot has not moved beyond {self.position_epsilon}m. Elapsed time: {elapsed:.2f}s')
+        self.get_logger().info('Goal accepted :)')
+        self.current_goal = goal_handle
 
-                if elapsed >= self.stuck_timeout and not self.stuck:
-                    self.get_logger().warning('Robot is stuck. Initiating recovery behavior.')
-                    self.stuck = True
-                    self.perform_recovery_behavior()
+        # Cancel the goal timeout timer since the goal was accepted
+        if hasattr(self, 'goal_timer'):
+            self.goal_timer.cancel()
+
+        self.result_future = goal_handle.get_result_async()
+        self.result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        """
+        Callback for handling the result from the action server after the goal is processed.
+        """
+        try:
+            result = future.result()
+        except Exception as e:
+            self.get_logger().error(f'Failed to get result: {e}')
+            self.handle_goal_failure()
+            return
+
+        status = result.status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('Goal succeeded!')
+            self.retry_count = 0  # Reset retry count on success
         else:
-            # Initialize last_pose
-            self.last_pose = current_pose
-            self.last_movement_time = self.get_clock().now()
-            self.get_logger().debug('Initialized last_pose.')
+            self.get_logger().info(f'Goal failed with status: {status}')
+            self.handle_goal_failure()
 
-        self.last_pose = current_pose
+        # Stop the movement monitoring timer
+        self.stop_movement_monitoring()
 
-    def split_waypoint(self, current_pos, target_pos, step=0.5):
+        # Look for the next frontier
+        self.find_and_navigate_to_frontier()
+
+    def handle_goal_failure(self):
         """
-        목표 웨이포인트를 현재 위치로부터 step 간격으로 분할하여 여러 개의 웨이포인트 리스트를 반환합니다.
+        Handles goal failure by retrying or stopping exploration after maximum retries.
         """
-        dx = target_pos.x - current_pos.x
-        dy = target_pos.y - current_pos.y
-        distance = math.sqrt(dx**2 + dy**2)
+        self.retry_count += 1
+        if self.retry_count >= self.max_retries:
+            self.get_logger().warn('Maximum retries reached. Stopping exploration.')
+            self.exploring = False
+            self.stop_robot()
+            self.mapping_complete()
+        else:
+            self.get_logger().info('Retrying with a new frontier.')
+            self.find_and_navigate_to_frontier()
 
-        if distance <= step:
-            return [target_pos]
+    def feedback_callback(self, feedback_msg):
+        """
+        Callback for processing feedback from the action server.
+        Currently unused but can be implemented as needed.
+        """
+        pass
 
-        num_steps = int(math.ceil(distance / step))
-        waypoints = []
+    def stop_robot(self):
+        """
+        Publishes zero velocities to stop the robot.
+        """
+        stop_msg = Twist()
+        stop_msg.linear.x = 0.0
+        stop_msg.linear.y = 0.0
+        stop_msg.linear.z = 0.0
+        stop_msg.angular.x = 0.0
+        stop_msg.angular.y = 0.0
+        stop_msg.angular.z = 0.0
+        self.cmd_vel_publisher.publish(stop_msg)
+        self.get_logger().info('Sent stop command to the robot.')
 
-        for i in range(1, num_steps + 1):
-            ratio = i / num_steps
-            intermediate_x = current_pos.x + ratio * dx
-            intermediate_y = current_pos.y + ratio * dy
-            intermediate_waypoint = Point(x=intermediate_x, y=intermediate_y, z=0.0)
-            waypoints.append(intermediate_waypoint)
+    # Movement monitoring methods
+    def start_movement_monitoring(self):
+        """
+        Initializes movement monitoring by recording the current position and starting a timer.
+        """
+        self.last_moving_position = self.get_robot_pose()
+        self.last_moving_time = self.get_clock().now()
+        self.movement_timer = self.create_timer(self.movement_check_interval, self.check_movement_callback)
+        self.get_logger().debug('Started movement monitoring.')
 
-        return waypoints
+    def stop_movement_monitoring(self):
+        """
+        Stops the movement monitoring timer.
+        """
+        if hasattr(self, 'movement_timer'):
+            self.movement_timer.cancel()
+            self.get_logger().debug('Stopped movement monitoring.')
+
+    def check_movement_callback(self):
+        """
+        Periodically checks if the robot has moved significantly. If not, considers the robot stuck.
+        """
+        current_time = self.get_clock().now()
+        current_position = self.get_robot_pose()
+        if current_position is None or self.last_moving_position is None:
+            return  # Can't get position
+
+        # Compute distance moved since last moving time
+        dx = current_position.x - self.last_moving_position.x
+        dy = current_position.y - self.last_moving_position.y
+        distance_moved = math.hypot(dx, dy)
+
+        if distance_moved >= self.movement_threshold:
+            # Robot has moved more than threshold, update last moving position and time
+            self.last_moving_position = current_position
+            self.last_moving_time = current_time
+            self.get_logger().debug('Robot has moved significantly.')
+        else:
+            # Robot hasn't moved significantly
+            time_since_last_move = (current_time - self.last_moving_time).nanoseconds / 1e9  # seconds
+            self.get_logger().debug(f'Robot has not moved significantly for {time_since_last_move:.2f} seconds.')
+            if time_since_last_move >= self.movement_timeout:
+                # Robot hasn't moved threshold distance in movement_timeout seconds, consider stuck
+                self.get_logger().warn('Robot is stuck, cancelling goal and sending a new one.')
+                self.cancel_current_goal()
+                # Start looking for a new frontier
+                self.find_and_navigate_to_frontier()
+
+    def cancel_current_goal(self):
+        """
+        Cancels the current navigation goal and resets exploration state.
+        """
+        if self.current_goal is not None:
+            try:
+                cancel_future = self.navigator.cancel_goal_async(self.current_goal)
+                cancel_future.add_done_callback(self.cancel_goal_response_callback)
+            except Exception as e:
+                self.get_logger().error(f'Failed to cancel goal: {e}')
+            self.current_goal = None
+            self.exploring = False  # Allow retry
+            self.stop_robot()
+            self.stop_movement_monitoring()
+            # Reset movement monitoring variables
+            self.last_moving_position = None
+            self.last_moving_time = None
+
+    def cancel_goal_response_callback(self, future):
+        """
+        Callback for handling the response from the action server after cancelling a goal.
+        """
+        try:
+            response = future.result()
+            if len(response.goals_canceling) > 0:
+                self.get_logger().info('Goal successfully cancelled.')
+            else:
+                self.get_logger().info('No goals were cancelled.')
+        except Exception as e:
+            self.get_logger().error(f'Failed to cancel goal: {e}')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -560,11 +544,11 @@ def main(args=None):
     try:
         rclpy.spin(explorer)
     except KeyboardInterrupt:
-        explorer.get_logger().info('Keyboard Interrupt (SIGINT)')
-    except Exception as e:
-        explorer.get_logger().error(f'Exception in main: {e}')
+        explorer.get_logger().info('Keyboard interrupt, shutting down.')
+        explorer.shutdown()
     finally:
-        explorer.shutdown_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
