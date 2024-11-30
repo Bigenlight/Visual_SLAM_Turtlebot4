@@ -34,14 +34,14 @@ class FrontierExplorer(Node):
         self.safety_distance = 0.1  # Safety distance in meters
         self.max_retries = 3  # Maximum number of goal retries
         self.retry_count = 0
-        self.goal_timeout = 15.0  # Goal reach timeout in seconds
+        self.goal_timeout = 20.0  # Goal reach timeout in seconds
 
         # Movement monitoring variables
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
         self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 3.0  # 3 seconds without movement
+        self.movement_timeout = 4.0  # 3 seconds without movement
 
         # No-frontier timer variables
         self.no_frontier_timer = None
