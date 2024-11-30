@@ -36,15 +36,22 @@ class FrontierExplorer(Node):
         self.safety_distance = 0.1  # Safety distance in meters
         self.max_retries = 3  # Maximum number of goal retries
         self.retry_count = 0
-        self.goal_timeout = 30.0  # Goal reach timeout in seconds
+        self.goal_timeout = 20.0  # Goal reach timeout in seconds
 
         # Movement monitoring variables
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
         self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 3.0  # 3 seconds without movement
+        self.movement_timeout = 4.0  # 3 seconds without movement
 
+<<<<<<< HEAD
+=======
+        # No-frontier timer variables
+        self.no_frontier_timer = None
+        self.no_frontier_duration = 60.0  # 10 seconds without frontiers
+
+>>>>>>> 89faf18c8f033754c22119f53d489aeae0e290ed
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
