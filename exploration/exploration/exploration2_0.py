@@ -41,7 +41,7 @@ class FrontierExplorer(Node):
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
         self.movement_threshold = 0.10  # 10 cm
-        self.movement_timeout = 4.0  # 3 seconds without movement
+        self.movement_timeout = 5.0  # 3 seconds without movement
 
         # No-frontier timer variables
         self.no_frontier_timer = None
@@ -61,7 +61,7 @@ class FrontierExplorer(Node):
 
         # Initialize visited frontiers list
         self.visited_frontiers = []
-        self.frontier_distance_threshold = 0.25  # 25 cm to consider a frontier as visited
+        self.frontier_distance_threshold = 0.1  # 25 cm to consider a frontier as visited
 
     def map_callback(self, msg):
         """
@@ -202,7 +202,7 @@ class FrontierExplorer(Node):
         if not frontiers:
             return []
 
-        clustering = DBSCAN(eps=0.5, min_samples=5).fit(frontiers)  # min_samples increased to filter small clusters
+        clustering = DBSCAN(eps=0.3, min_samples=5).fit(frontiers)  # min_samples increased to filter small clusters
         labels = clustering.labels_
 
         unique_labels = set(labels)
