@@ -7,7 +7,7 @@ from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 import numpy as np
 from tf2_ros import Buffer, TransformListener
-import tf2_ros  # tf2_ros 모듈 import 추가
+import tf2_ros
 import math
 from rclpy.duration import Duration
 import scipy.ndimage
@@ -57,6 +57,9 @@ class FrontierExplorer(Node):
 
         self.declare_parameter('waypoint_spacing', 0.5)  # 웨이포인트 간격을 0.5미터로 설정
         self.waypoint_spacing = self.get_parameter('waypoint_spacing').get_parameter_value().double_value
+
+        self.declare_parameter('max_waypoint_distance', 1.0)  # 최대 웨이포인트 거리 기준 설정
+        self.max_waypoint_distance = self.get_parameter('max_waypoint_distance').get_parameter_value().double_value
 
         self.declare_parameter('robot_width', 0.33)
         self.robot_width = self.get_parameter('robot_width').get_parameter_value().double_value
@@ -161,20 +164,21 @@ class FrontierExplorer(Node):
             if cluster_label == -1:
                 continue  # 노이즈 제거
             cluster_points = points[clustering.labels_ == cluster_label]
-            center = cluster_points.mean(axis=0)
-            cluster_centers.append(center)
+
+            # 양쪽에 벽이 있는 경계선만 선택
+            valid_frontier = self.filter_frontier_with_walls(cluster_points)
+            if valid_frontier is not None:
+                cluster_centers.append(valid_frontier)
 
         if not cluster_centers:
-            self.get_logger().warning('No clusters found for frontiers.')
+            self.get_logger().warning('No valid clusters found for frontiers.')
             return []
 
         # 웨이포인트 생성
         waypoints = []
         for center in cluster_centers:
             if self.is_safe_point(center[0], center[1]):
-                # 벽과 벽 중앙에 웨이포인트를 위치시키기 위한 조정
-                adjusted_waypoint = self.adjust_waypoint_position(center)
-                waypoints.append(adjusted_waypoint)
+                waypoints.append(Point(x=center[0], y=center[1], z=0.0))
             else:
                 self.get_logger().debug(f'Waypoint at ({center[0]:.2f}, {center[1]:.2f}) is not safe.')
 
@@ -184,15 +188,30 @@ class FrontierExplorer(Node):
         self.get_logger().info(f'Generated {len(waypoints)} waypoints for exploration.')
         return waypoints
 
-    def adjust_waypoint_position(self, center):
+    def filter_frontier_with_walls(self, cluster_points):
         """
-        웨이포인트를 벽과 벽 중앙에 위치시키기 위해 조정합니다.
-        현재는 간단하게 중앙에 위치하도록 유지.
-        필요에 따라 추가적인 로직을 구현할 수 있습니다.
+        클러스터 내의 포인트 중 양쪽에 벽이 있는 경계선의 중심을 찾습니다.
         """
-        # 추가적인 조정 로직이 필요한 경우 여기서 구현
-        waypoint = Point(x=center[0], y=center[1], z=0.0)
-        return waypoint
+        for point in cluster_points:
+            x_idx = int((point[0] - self.map_info.origin.position.x) / self.map_info.resolution)
+            y_idx = int((point[1] - self.map_info.origin.position.y) / self.map_info.resolution)
+
+            # 맵 인덱스가 유효한지 확인
+            if x_idx < 1 or x_idx >= self.map_info.width - 1 or y_idx < 1 or y_idx >= self.map_info.height - 1:
+                continue
+
+            # 상하좌우 검사하여 양쪽에 벽이 있는지 확인
+            neighbors = self.map_data[y_idx - 1:y_idx + 2, x_idx - 1:x_idx + 2].flatten()
+            counts = np.bincount(neighbors + 1)  # -1, 0, 100을 0, 1, 2로 변환
+            unknown_count = counts[0] if len(counts) > 0 else 0
+            free_count = counts[1] if len(counts) > 1 else 0
+            occupied_count = counts[2] if len(counts) > 2 else 0
+
+            # 주변에 벽(occupied)이 두 개 이상 있고, 자유 공간(free)이 하나 이상이면 유효한 프런티어로 간주
+            if occupied_count >= 2 and free_count >= 1:
+                return point  # 해당 포인트를 반환
+
+        return None
 
     def is_safe_point(self, x_world, y_world):
         # 월드 좌표를 맵 인덱스로 변환
@@ -253,9 +272,19 @@ class FrontierExplorer(Node):
             dy = target_waypoint.y - current_pose.y
             distance = math.sqrt(dx**2 + dy**2)
 
-            # 웨이포인트가 너무 멀면 0.3m 간격으로 분할
-            if distance > self.waypoint_spacing:
-                new_waypoints = self.split_waypoint(current_pose, target_waypoint, self.waypoint_spacing)
+            # 웨이포인트가 최대 거리보다 멀면 0.5m 간격으로 분할
+            if distance > self.max_waypoint_distance:
+                new_waypoints = self.split_waypoint(current_pose, target_waypoint, step=0.5)
+                if new_waypoints:
+                    # 현재 웨이포인트를 분할된 웨이포인트로 대체
+                    self.waypoints = self.waypoints[:self.current_waypoint_index] + new_waypoints + self.waypoints[self.current_waypoint_index + 1:]
+                    self.get_logger().info(f'Waypoint too far ({distance:.2f}m). Splitting into {len(new_waypoints)} smaller waypoints.')
+                self.send_next_waypoint()
+                return
+
+            # 웨이포인트가 0.5m를 초과하면 0.5m 간격으로 분할
+            elif distance > self.waypoint_spacing:
+                new_waypoints = self.split_waypoint(current_pose, target_waypoint, step=self.waypoint_spacing)
                 if new_waypoints:
                     # 현재 웨이포인트를 분할된 웨이포인트로 대체
                     self.waypoints = self.waypoints[:self.current_waypoint_index] + new_waypoints + self.waypoints[self.current_waypoint_index + 1:]
@@ -274,6 +303,10 @@ class FrontierExplorer(Node):
             # 즉, map_callback이 다시 호출될 때 plan_and_execute_exploration()이 실행됨
 
     def send_goal(self, goal_pose):
+        if not self.navigator.server_is_ready():
+            self.get_logger().error('Action server is not ready. Cannot send goal.')
+            return
+
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal_pose
 
@@ -283,17 +316,23 @@ class FrontierExplorer(Node):
         self.current_goal_active = True
 
     def goal_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warning('Goal rejected by the action server.')
+        try:
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self.get_logger().warning('Goal rejected by the action server.')
+                self.current_goal_active = False
+                self.current_waypoint_index += 1
+                self.send_next_waypoint()
+                return
+
+            self.get_logger().info('Goal accepted by the action server.')
+            self.goal_handle = goal_handle
+            self.goal_handle.get_result_async().add_done_callback(self.get_result_callback)
+        except Exception as e:
+            self.get_logger().error(f'Exception in goal_response_callback: {e}')
             self.current_goal_active = False
             self.current_waypoint_index += 1
             self.send_next_waypoint()
-            return
-
-        self.get_logger().info('Goal accepted by the action server.')
-        self.goal_handle = goal_handle
-        goal_handle.get_result_async().add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
         try:
@@ -318,7 +357,7 @@ class FrontierExplorer(Node):
         if self.goal_handle is not None:
             self.get_logger().info('Cancelling current goal due to being stuck.')
             try:
-                cancel_future = self.goal_handle.cancel_goal_async()  # 수정된 부분
+                cancel_future = self.goal_handle.cancel_goal_async()
                 cancel_future.add_done_callback(self.cancel_goal_callback)
             except AttributeError as e:
                 self.get_logger().error(f'Error cancelling goal: {e}')
@@ -347,7 +386,7 @@ class FrontierExplorer(Node):
         # 제자리에서 회전하여 장애물 회피 시도
         twist = Twist()
         twist.angular.z = 0.5  # 시계방향으로 0.5 rad/s 회전
-        duration = 5.0  # 5초 동안 회전
+        duration = 2.0  # 2초 동안 회전
         start_time = self.get_clock().now()
         self.get_logger().info('Rotating in place for recovery.')
 
@@ -492,7 +531,7 @@ class FrontierExplorer(Node):
 
         self.last_pose = current_pose
 
-    def split_waypoint(self, current_pos, target_pos, step=0.3):
+    def split_waypoint(self, current_pos, target_pos, step=0.5):
         """
         목표 웨이포인트를 현재 위치로부터 step 간격으로 분할하여 여러 개의 웨이포인트 리스트를 반환합니다.
         """
