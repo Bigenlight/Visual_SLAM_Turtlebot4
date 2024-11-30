@@ -44,7 +44,7 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
-        self.movement_threshold = 0.10  # 10 cm
+        self.movement_threshold = 0.05  # 10 cm
         self.movement_timeout = 3.0  # 3초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
