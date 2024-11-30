@@ -33,8 +33,8 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
-        self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
+        self.max_frontier_distance = 4.0  # 최대 탐사 거리 (미터)
+        self.min_frontier_distance = 0.41  # 최소 목표 거리 (미터, 허용 오차)
         self.safety_distance = 0.1  # 안전 거리 (미터)
         self.max_retries = 3  # 최대 목표 재시도 횟수
         self.retry_count = 0
@@ -45,7 +45,7 @@ class FrontierExplorer(Node):
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
         self.movement_threshold = 0.05  # 10 cm
-        self.movement_timeout = 3.0  # 3초 동안 이동하지 않으면 정지
+        self.movement_timeout = 10.0  # 3초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
