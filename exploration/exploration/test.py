@@ -171,7 +171,7 @@ class FrontierExplorer(Node):
         self.get_logger().info(f'미지 영역 비율: {unknown_ratio:.2%}')
 
         # 임계값 설정 (예: 미지 영역이 5% 미만일 때 탐색 완료로 판단)
-        if unknown_ratio < 0.05:
+        if unknown_ratio < 0.01:
             return True
         else:
             return False
