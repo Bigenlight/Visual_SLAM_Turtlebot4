@@ -11,6 +11,8 @@ import math
 from sklearn.cluster import DBSCAN
 from std_msgs.msg import Bool
 from collections import deque
+from visualization_msgs.msg import Marker, MarkerArray
+
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -31,8 +33,8 @@ class FrontierExplorer(Node):
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 4.0  # 최대 탐사 거리 (미터)
-        self.min_frontier_distance = 0.41  # 최소 목표 거리 (미터, 허용 오차)
+        self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
+        self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
         self.safety_distance = 0.1  # 안전 거리 (미터)
         self.max_retries = 3  # 최대 목표 재시도 횟수
         self.retry_count = 0
@@ -68,6 +70,9 @@ class FrontierExplorer(Node):
         # 청소 알고리즘으로 신호를 보내기 위한 퍼블리셔 초기화
         self.cleaning_publisher = self.create_publisher(Bool, '/cleaning', 10)
 
+        # RViz 시각화를 위한 마커 퍼블리셔 초기화
+        self.marker_publisher = self.create_publisher(MarkerArray, 'frontier_markers', 10)
+
     def map_callback(self, msg):
         """
         /map 토픽의 콜백 함수.
@@ -84,6 +89,8 @@ class FrontierExplorer(Node):
         """
         프론티어를 탐지하고, 클러스터링하며, 유효한 프론티어를 선택하여 네비게이션 목표를 보냅니다.
         """
+        self.get_logger().debug('Starting find_and_navigate_to_frontier.')
+
         # 프론티어 탐지
         frontiers = self.detect_frontiers()
 
@@ -152,8 +159,7 @@ class FrontierExplorer(Node):
         )
         send_goal_future.add_done_callback(self.goal_response_callback)
 
-        # 이동 모니터링 타이머 시작
-        self.start_movement_monitoring()
+        # 이동 모니터링 타이머는 목표가 수락된 후에 시작됨
 
     def is_map_explored(self):
         """
@@ -227,6 +233,7 @@ class FrontierExplorer(Node):
         프론티어는 적어도 두 개의 미지 셀과 인접한 자유 셀입니다.
         """
         if self.map_data is None:
+            self.get_logger().warn('Map data is not available.')
             return []
 
         height, width = self.map_data.shape
@@ -246,18 +253,20 @@ class FrontierExplorer(Node):
                 mx, my = self.grid_to_map(x, y)
                 frontier_points.append([mx, my])
 
-        self.get_logger().info(f'감지된 프론티어 포인트 수: {len(frontier_points)}')
+        self.get_logger().info(f'Detected {len(frontier_points)} frontier points.')
         return frontier_points
 
     def cluster_frontiers(self, frontiers):
         """
         DBSCAN을 사용하여 프론티어 포인트를 클러스터링하고 작은 클러스터는 필터링합니다.
         유효한 클러스터의 중심점을 반환합니다.
+        또한 RViz 시각화를 위해 마커를 퍼블리시합니다.
         """
         if not frontiers:
+            self.get_logger().warn('No frontiers to cluster.')
             return []
 
-        clustering = DBSCAN(eps=0.5, min_samples=5).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
+        clustering = DBSCAN(eps=0.3, min_samples=5).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
         labels = clustering.labels_
 
         unique_labels = set(labels)
@@ -275,7 +284,7 @@ class FrontierExplorer(Node):
 
             # 너무 작은 클러스터는 무시
             if cluster_size < min_cluster_size:
-                self.get_logger().debug(f'라벨 {label}의 작은 클러스터 크기 {cluster_size} 무시')
+                self.get_logger().debug(f'Ignoring small cluster with label {label} of size {cluster_size}')
                 continue
 
             # 클러스터의 중심점 계산
@@ -283,7 +292,11 @@ class FrontierExplorer(Node):
             point = Point(x=centroid[0], y=centroid[1], z=0.0)
             clustered_frontiers.append(point)
 
-        self.get_logger().info(f'필터링 후 유효한 클러스터 수: {len(clustered_frontiers)}')
+        self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
+
+        # RViz 시각화를 위한 마커 퍼블리시
+        self.publish_frontier_markers(clustered_frontiers)
+
         return clustered_frontiers
 
     def select_frontier(self, frontiers):
@@ -320,6 +333,7 @@ class FrontierExplorer(Node):
                 self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 거리 범위를 벗어났습니다.')
 
         if not valid_frontiers:
+            self.get_logger().info('유효한 프론티어가 없습니다.')
             return None
 
         # 가장 가까운 프론티어 선택
@@ -334,6 +348,7 @@ class FrontierExplorer(Node):
         목표 위치가 안전한지 확인하여, 안전 거리 내에 장애물이 없는지 검사합니다.
         """
         if self.map_info is None or self.map_data is None:
+            self.get_logger().warn('Map information or data is not available for safety check.')
             return False
 
         # 안전 거리에 해당하는 셀 수 계산
@@ -445,6 +460,9 @@ class FrontierExplorer(Node):
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(self.get_result_callback)
 
+        # 이동 모니터링 타이머 시작
+        self.start_movement_monitoring()
+
     def get_result_callback(self, future):
         """
         액션 서버로부터 목표 결과를 처리하는 콜백 함수입니다.
@@ -467,6 +485,9 @@ class FrontierExplorer(Node):
         # 이동 모니터링 타이머 정지
         self.stop_movement_monitoring()
 
+        # 탐사 플래그 리셋하여 다음 탐사를 허용
+        self.exploring = False
+
         # 다음 프론티어 탐색
         self.find_and_navigate_to_frontier()
 
@@ -486,7 +507,8 @@ class FrontierExplorer(Node):
             self.shutdown()
         else:
             self.get_logger().info('같은 프론티어로 재시도합니다.')
-            self.navigate_to_current_goal()
+            self.exploring = False  # 탐사를 재시도하도록 플래그 리셋
+            self.find_and_navigate_to_frontier()
 
     def feedback_callback(self, feedback_msg):
         """
@@ -494,32 +516,6 @@ class FrontierExplorer(Node):
         현재는 사용되지 않지만 필요에 따라 구현할 수 있습니다.
         """
         pass
-
-    def navigate_to_current_goal(self):
-        """
-        현재 목표 위치로 다시 네비게이션 목표를 보냅니다.
-        """
-        if self.current_goal_position is None:
-            self.get_logger().error('네비게이션할 현재 목표 위치가 없습니다.')
-            return
-
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = PoseStamped()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.pose.pose.position = self.current_goal_position
-        goal_msg.pose.pose.orientation.w = 1.0  # 앞으로 향하도록 설정
-
-        self.get_logger().info(f'프론티어로 재시도 중: ({self.current_goal_position.x:.2f}, {self.current_goal_position.y:.2f})')
-
-        send_goal_future = self.navigator.send_goal_async(
-            goal_msg,
-            feedback_callback=self.feedback_callback
-        )
-        send_goal_future.add_done_callback(self.goal_response_callback)
-
-        # 이동 모니터링 타이머 시작
-        self.start_movement_monitoring()
 
     def shutdown(self):
         """
@@ -561,8 +557,13 @@ class FrontierExplorer(Node):
         """
         현재 위치를 기록하고 이동을 모니터링하기 위한 타이머를 시작합니다.
         """
+        # 기존의 이동 모니터링 타이머가 있다면 취소
+        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
+            self.movement_timer.cancel()
+            self.get_logger().debug('기존 이동 모니터링 타이머가 취소되었습니다.')
+
         self.last_moving_position = self.get_robot_pose()
-        self.last_moving_time = self.get_clock().now()
+        self.last_moving_time = None  # 초기화
         self.movement_timer = self.create_timer(self.movement_check_interval, self.check_movement_callback)
         self.get_logger().debug('이동 모니터링을 시작하였습니다.')
 
@@ -572,6 +573,7 @@ class FrontierExplorer(Node):
         """
         if hasattr(self, 'movement_timer') and self.movement_timer is not None:
             self.movement_timer.cancel()
+            self.movement_timer = None
             self.get_logger().debug('이동 모니터링을 정지하였습니다.')
 
     def check_movement_callback(self):
@@ -592,19 +594,52 @@ class FrontierExplorer(Node):
         if distance_moved >= self.movement_threshold:
             # 충분히 이동했으면 위치와 시간을 업데이트
             self.last_moving_position = current_position
-            self.last_moving_time = current_time
+            self.last_moving_time = None  # 리셋
             self.get_logger().debug('로봇이 충분히 이동하였습니다.')
         else:
-            # 이동하지 않았으면 이동하지 않은 시간을 계산
+            if self.last_moving_time is None:
+                # 로봇이 이동하지 않았을 경우 타이머 시작
+                self.last_moving_time = current_time
+                self.get_logger().debug('로봇이 충분히 이동하지 않았습니다. 이동 타임아웃 타이머를 시작합니다.')
+                return
+
+            # 마지막으로 이동한 이후로 경과한 시간 계산
             time_since_last_move = (current_time - self.last_moving_time).nanoseconds / 1e9  # 초 단위
             self.get_logger().debug(f'로봇이 {time_since_last_move:.2f}초 동안 충분히 이동하지 않았습니다.')
+
             if time_since_last_move >= self.movement_timeout:
                 # 이동하지 않은 시간이 임계값을 초과하면 목표를 취소하고 다음 프론티어 탐색
                 self.get_logger().warn('로봇이 정체되었습니다. 목표를 취소하고 다음 프론티어를 탐색합니다.')
                 if self.current_goal_position is not None:
                     self.failed_frontiers.append(self.current_goal_position)  # 실패한 프론티어로 기록
                 self.cancel_current_goal()
-                self.find_and_navigate_to_frontier()
+                # 탐사는 cancel_goal_response_callback에서 다시 트리거됩니다.
+
+    def publish_frontier_markers(self, frontiers):
+        """
+        RViz 시각화를 위한 프론티어 마커를 퍼블리시합니다.
+        """
+        marker_array = MarkerArray()
+        for idx, frontier in enumerate(frontiers):
+            marker = Marker()
+            marker.header.frame_id = 'map'
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = 'frontiers'
+            marker.id = idx
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position = frontier
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.2
+            marker.scale.y = 0.2
+            marker.scale.z = 0.2
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker_array.markers.append(marker)
+        self.marker_publisher.publish(marker_array)
+        self.get_logger().debug('프론티어 마커를 RViz에 퍼블리시하였습니다.')
 
     def cancel_current_goal(self):
         """
@@ -617,7 +652,6 @@ class FrontierExplorer(Node):
             except Exception as e:
                 self.get_logger().error(f'목표를 취소하는 데 실패하였습니다: {e}')
             self.current_goal = None
-            self.exploring = False  # 재시도를 허용
             self.stop_robot()
             self.stop_movement_monitoring()
             # 이동 모니터링 변수 초기화
@@ -636,26 +670,28 @@ class FrontierExplorer(Node):
                 self.get_logger().info('취소된 목표가 없습니다.')
         except Exception as e:
             self.get_logger().error(f'목표 취소에 실패하였습니다: {e}')
+            return  # 취소 실패 시 탐사 재시도는 생략
 
-    def cancel_all_timers(self):
-        """
-        모든 활성 타이머를 취소하여 깨끗하게 종료합니다.
-        """
-        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
-            self.movement_timer.cancel()
-        # 기존 no_frontier_timer 관련 코드는 제거되었으므로 생략
+        # 탐사를 재시도하기 위해 탐사 플래그 리셋 후 탐사 시작
+        self.exploring = False
+        self.find_and_navigate_to_frontier()
+
 
 def main(args=None):
     rclpy.init(args=args)
     explorer = FrontierExplorer()
+
+    # 멀티스레드 실행기를 사용하여 타이머와 콜백이 병렬로 실행되도록 함
+    executor = rclpy.executors.MultiThreadedExecutor()
     try:
-        rclpy.spin(explorer)
+        rclpy.spin(explorer, executor=executor)
     except KeyboardInterrupt:
         explorer.get_logger().info('키보드 인터럽트가 발생하여 종료합니다.')
         explorer.shutdown()
     finally:
         if rclpy.ok():
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
