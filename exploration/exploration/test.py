@@ -12,6 +12,7 @@ from sklearn.cluster import DBSCAN
 from std_msgs.msg import Bool
 from collections import deque
 from visualization_msgs.msg import Marker, MarkerArray
+from slam_toolbox.srv import SaveMap  # 맵 저장 서비스 임포트
 
 
 class FrontierExplorer(Node):
@@ -28,14 +29,17 @@ class FrontierExplorer(Node):
         # NavigateToPose 액션 클라이언트 초기화
         self.navigator = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
+        # 맵 저장 서비스 클라이언트 초기화
+        self.save_map_client = self.create_client(SaveMap, '/slam_toolbox/save_map')
+
         # 변수 초기화
         self.map_data = None
         self.map_info = None
         self.current_goal = None
         self.exploring = False
-        self.max_frontier_distance = 4.0  # 최대 탐사 거리 (미터)
-        self.min_frontier_distance = 0.41  # 최소 목표 거리 (미터, 허용 오차)
-        self.safety_distance = 0.2  # 안전 거리 (미터)
+        self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
+        self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
+        self.safety_distance = 0.1  # 안전 거리 (미터)
         self.max_retries = 3  # 최대 목표 재시도 횟수
         self.retry_count = 0
         self.goal_timeout = 30.0  # 목표 도달 타임아웃 (초)
@@ -44,8 +48,8 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
-        self.movement_threshold = 0.05  # m
-        self.movement_timeout = 10.0  # 3초 동안 이동하지 않으면 정지
+        self.movement_threshold = 0.10  # 10 cm
+        self.movement_timeout = 3.0  # 3초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -180,8 +184,8 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
 
-        # 임계값 설정 (예: 접근 가능한 미지 영역이 0.1% 미만일 때 탐색 완료로 판단)
-        if accessible_unknown_ratio < 0.0005:
+        # 임계값 설정 (예: 접근 가능한 미지 영역이 1% 미만일 때 탐색 완료로 판단)
+        if accessible_unknown_ratio < 0.01:
             return True
         else:
             return False
@@ -204,6 +208,10 @@ class FrontierExplorer(Node):
         robot_grid_y = int((robot_pose.y - self.map_info.origin.position.y) / self.map_info.resolution)
 
         height, width = self.map_data.shape
+        if not (0 <= robot_grid_x < width and 0 <= robot_grid_y < height):
+            self.get_logger().warn('로봇의 그리드 위치가 맵 범위를 벗어났습니다.')
+            return 0
+
         visited = np.zeros((height, width), dtype=bool)
         queue = deque()
         queue.append((robot_grid_x, robot_grid_y))
@@ -266,7 +274,7 @@ class FrontierExplorer(Node):
             self.get_logger().warn('No frontiers to cluster.')
             return []
 
-        clustering = DBSCAN(eps=0.2, min_samples=4).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
+        clustering = DBSCAN(eps=0.3, min_samples=5).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
         labels = clustering.labels_
 
         unique_labels = set(labels)
@@ -370,7 +378,7 @@ class FrontierExplorer(Node):
         for y in range(min_y, max_y + 1):
             for x in range(min_x, max_x + 1):
                 cell_value = self.map_data[y, x]
-                if cell_value > 30:  # 장애물 임계값 (필요에 따라 조정)
+                if cell_value > 50:  # 장애물 임계값 (필요에 따라 조정)
                     self.get_logger().debug(f'장애물 발견: 그리드 ({x}, {y}), 값: {cell_value}')
                     return False
         self.get_logger().debug(f'목표 ({goal_x:.2f}, {goal_y:.2f})는 안전합니다.')
@@ -522,6 +530,10 @@ class FrontierExplorer(Node):
         탐사를 중단하고 노드를 정상적으로 종료합니다.
         """
         self.get_logger().info('탐사 노드를 종료합니다.')
+
+        # 맵 저장 서비스 호출
+        self.save_map()
+
         # 청소 알고리즘 시작 신호 발행
         cleaning_msg = Bool()
         cleaning_msg.data = True
@@ -538,143 +550,32 @@ class FrontierExplorer(Node):
         self.destroy_node()
         rclpy.shutdown()
 
-    def stop_robot(self):
+    def save_map(self):
         """
-        로봇을 정지시키기 위해 제로 속도를 퍼블리시합니다.
+        현재 맵을 저장하기 위해 /slam_toolbox/save_map 서비스를 호출합니다.
         """
-        stop_msg = Twist()
-        stop_msg.linear.x = 0.0
-        stop_msg.linear.y = 0.0
-        stop_msg.linear.z = 0.0
-        stop_msg.angular.x = 0.0
-        stop_msg.angular.y = 0.0
-        stop_msg.angular.z = 0.0
-        self.cmd_vel_publisher.publish(stop_msg)
-        self.get_logger().info('로봇 정지 명령을 보냈습니다.')
+        self.get_logger().info('맵 저장 서비스를 호출합니다.')
 
-    # 이동 모니터링 메소드
-    def start_movement_monitoring(self):
-        """
-        현재 위치를 기록하고 이동을 모니터링하기 위한 타이머를 시작합니다.
-        """
-        # 기존의 이동 모니터링 타이머가 있다면 취소
-        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
-            self.movement_timer.cancel()
-            self.get_logger().debug('기존 이동 모니터링 타이머가 취소되었습니다.')
+        # 서비스가 준비될 때까지 대기
+        if not self.save_map_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error('/slam_toolbox/save_map 서비스가 준비되지 않았습니다.')
+            return
 
-        self.last_moving_position = self.get_robot_pose()
-        self.last_moving_time = None  # 초기화
-        self.movement_timer = self.create_timer(self.movement_check_interval, self.check_movement_callback)
-        self.get_logger().debug('이동 모니터링을 시작하였습니다.')
+        # 서비스 요청 생성
+        request = SaveMap.Request()
+        request.name = ''
+        request.data = 'map_test'
 
-    def stop_movement_monitoring(self):
-        """
-        이동 모니터링 타이머를 정지합니다.
-        """
-        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
-            self.movement_timer.cancel()
-            self.movement_timer = None
-            self.get_logger().debug('이동 모니터링을 정지하였습니다.')
+        # 비동기로 서비스 호출
+        future = self.save_map_client.call_async(request)
 
-    def check_movement_callback(self):
-        """
-        주기적으로 로봇이 충분히 이동했는지 확인합니다.
-        이동하지 않았을 경우 현재 목표를 취소하고 다음 프론티어를 탐색합니다.
-        """
-        current_time = self.get_clock().now()
-        current_position = self.get_robot_pose()
-        if current_position is None or self.last_moving_position is None:
-            return  # 위치를 가져올 수 없는 경우
+        # 서비스 결과 대기
+        rclpy.spin_until_future_complete(self, future)
 
-        # 마지막으로 이동한 이후로 이동한 거리 계산
-        dx = current_position.x - self.last_moving_position.x
-        dy = current_position.y - self.last_moving_position.y
-        distance_moved = math.hypot(dx, dy)
-
-        if distance_moved >= self.movement_threshold:
-            # 충분히 이동했으면 위치와 시간을 업데이트
-            self.last_moving_position = current_position
-            self.last_moving_time = None  # 리셋
-            self.get_logger().debug('로봇이 충분히 이동하였습니다.')
+        if future.result() is not None:
+            self.get_logger().info('맵이 성공적으로 저장되었습니다.')
         else:
-            if self.last_moving_time is None:
-                # 로봇이 이동하지 않았을 경우 타이머 시작
-                self.last_moving_time = current_time
-                self.get_logger().debug('로봇이 충분히 이동하지 않았습니다. 이동 타임아웃 타이머를 시작합니다.')
-                return
-
-            # 마지막으로 이동한 이후로 경과한 시간 계산
-            time_since_last_move = (current_time - self.last_moving_time).nanoseconds / 1e9  # 초 단위
-            self.get_logger().debug(f'로봇이 {time_since_last_move:.2f}초 동안 충분히 이동하지 않았습니다.')
-
-            if time_since_last_move >= self.movement_timeout:
-                # 이동하지 않은 시간이 임계값을 초과하면 목표를 취소하고 다음 프론티어 탐색
-                self.get_logger().warn('로봇이 정체되었습니다. 목표를 취소하고 다음 프론티어를 탐색합니다.')
-                if self.current_goal_position is not None:
-                    self.failed_frontiers.append(self.current_goal_position)  # 실패한 프론티어로 기록
-                self.cancel_current_goal()
-                # 탐사는 cancel_goal_response_callback에서 다시 트리거됩니다.
-
-    def publish_frontier_markers(self, frontiers):
-        """
-        RViz 시각화를 위한 프론티어 마커를 퍼블리시합니다.
-        """
-        marker_array = MarkerArray()
-        for idx, frontier in enumerate(frontiers):
-            marker = Marker()
-            marker.header.frame_id = 'odom'  # 'map'에서 'odom'으로 변경
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = 'frontiers'
-            marker.id = idx
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position = frontier
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.2
-            marker.scale.y = 0.2
-            marker.scale.z = 0.2
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker_array.markers.append(marker)
-        self.marker_publisher.publish(marker_array)
-        self.get_logger().debug('프론티어 마커를 RViz에 퍼블리시하였습니다.')
-
-    def cancel_current_goal(self):
-        """
-        현재 네비게이션 목표를 취소하고 탐사 상태를 초기화합니다.
-        """
-        if self.current_goal is not None:
-            try:
-                cancel_future = self.navigator.cancel_goal_async(self.current_goal)
-                cancel_future.add_done_callback(self.cancel_goal_response_callback)
-            except Exception as e:
-                self.get_logger().error(f'목표를 취소하는 데 실패하였습니다: {e}')
-            self.current_goal = None
-            self.stop_robot()
-            self.stop_movement_monitoring()
-            # 이동 모니터링 변수 초기화
-            self.last_moving_position = None
-            self.last_moving_time = None
-
-    def cancel_goal_response_callback(self, future):
-        """
-        목표 취소 요청에 대한 응답을 처리하는 콜백 함수입니다.
-        """
-        try:
-            response = future.result()
-            if len(response.goals_canceling) > 0:
-                self.get_logger().info('목표가 성공적으로 취소되었습니다.')
-            else:
-                self.get_logger().info('취소된 목표가 없습니다.')
-        except Exception as e:
-            self.get_logger().error(f'목표 취소에 실패하였습니다: {e}')
-            return  # 취소 실패 시 탐사 재시도는 생략
-
-        # 탐사를 재시도하기 위해 탐사 플래그 리셋 후 탐사 시작
-        self.exploring = False
-        self.find_and_navigate_to_frontier()
+            self.get_logger().error('맵 저장에 실패하였습니다.')
 
     def cancel_all_timers(self):
         """
