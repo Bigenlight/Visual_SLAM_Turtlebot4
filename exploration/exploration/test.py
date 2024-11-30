@@ -35,7 +35,7 @@ class FrontierExplorer(Node):
         self.exploring = False
         self.max_frontier_distance = 4.0  # 최대 탐사 거리 (미터)
         self.min_frontier_distance = 0.41  # 최소 목표 거리 (미터, 허용 오차)
-        self.safety_distance = 0.1  # 안전 거리 (미터)
+        self.safety_distance = 0.2  # 안전 거리 (미터)
         self.max_retries = 3  # 최대 목표 재시도 횟수
         self.retry_count = 0
         self.goal_timeout = 30.0  # 목표 도달 타임아웃 (초)
@@ -44,7 +44,7 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
-        self.movement_threshold = 0.05  # 10 cm
+        self.movement_threshold = 0.05  # m
         self.movement_timeout = 10.0  # 3초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
@@ -181,7 +181,7 @@ class FrontierExplorer(Node):
         self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
 
         # 임계값 설정 (예: 접근 가능한 미지 영역이 0.1% 미만일 때 탐색 완료로 판단)
-        if accessible_unknown_ratio < 0.001:
+        if accessible_unknown_ratio < 0.0005:
             return True
         else:
             return False
