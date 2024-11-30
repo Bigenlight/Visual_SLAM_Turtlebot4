@@ -32,7 +32,7 @@ class FrontierExplorer(Node):
         self.current_goal = None
         self.exploring = False
         self.max_frontier_distance = 20.0  # Maximum exploration distance in meters
-        self.min_frontier_distance = 0.41  # Minimum goal distance in meters (tolerance)
+        self.min_frontier_distance = 0.36  # Minimum goal distance in meters (tolerance)
         self.safety_distance = 0.1  # Safety distance in meters
         self.max_retries = 3  # Maximum number of goal retries
         self.retry_count = 0
