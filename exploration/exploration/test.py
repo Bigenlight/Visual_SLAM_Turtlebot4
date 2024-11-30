@@ -180,8 +180,8 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
 
-        # 임계값 설정 (예: 접근 가능한 미지 영역이 1% 미만일 때 탐색 완료로 판단)
-        if accessible_unknown_ratio < 0.01:
+        # 임계값 설정 (예: 접근 가능한 미지 영역이 0.1% 미만일 때 탐색 완료로 판단)
+        if accessible_unknown_ratio < 0.001:
             return True
         else:
             return False
@@ -266,7 +266,7 @@ class FrontierExplorer(Node):
             self.get_logger().warn('No frontiers to cluster.')
             return []
 
-        clustering = DBSCAN(eps=0.3, min_samples=5).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
+        clustering = DBSCAN(eps=0.2, min_samples=4).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
         labels = clustering.labels_
 
         unique_labels = set(labels)
@@ -370,7 +370,7 @@ class FrontierExplorer(Node):
         for y in range(min_y, max_y + 1):
             for x in range(min_x, max_x + 1):
                 cell_value = self.map_data[y, x]
-                if cell_value > 50:  # 장애물 임계값 (필요에 따라 조정)
+                if cell_value > 30:  # 장애물 임계값 (필요에 따라 조정)
                     self.get_logger().debug(f'장애물 발견: 그리드 ({x}, {y}), 값: {cell_value}')
                     return False
         self.get_logger().debug(f'목표 ({goal_x:.2f}, {goal_y:.2f})는 안전합니다.')
@@ -675,6 +675,17 @@ class FrontierExplorer(Node):
         # 탐사를 재시도하기 위해 탐사 플래그 리셋 후 탐사 시작
         self.exploring = False
         self.find_and_navigate_to_frontier()
+
+    def cancel_all_timers(self):
+        """
+        모든 활성 타이머를 취소하여 깨끗하게 종료합니다.
+        """
+        if hasattr(self, 'movement_timer') and self.movement_timer is not None:
+            self.movement_timer.cancel()
+            self.get_logger().debug('이동 모니터링 타이머를 취소하였습니다.')
+
+        # 다른 타이머가 있다면 추가로 취소
+        # 예: self.another_timer.cancel()
 
 
 def main(args=None):
