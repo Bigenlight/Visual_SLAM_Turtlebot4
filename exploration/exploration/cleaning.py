@@ -57,11 +57,17 @@ class CleaningNode(Node):
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
         self.marker_publisher = self.create_publisher(MarkerArray, 'cleaning_markers', 10)
 
+        # OccupancyGrid 퍼블리셔 초기화
+        self.map_publisher = self.create_publisher(OccupancyGrid, 'map', 10)
+
         # 맵 파일 경로 설정
         self.map_file_path = '/home/theo/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
 
         # 맵 데이터 로드
         self.load_map(self.map_file_path)
+
+        # 맵 퍼블리시
+        self.publish_map()
 
         # 초기 위치 저장
         self.get_initial_pose()
@@ -143,12 +149,14 @@ class CleaningNode(Node):
             self.map_info = map_info
 
             self.get_logger().info(f'맵을 성공적으로 로드하였습니다: {width}x{height}, 해상도={resolution}m/pix')
+            self.get_logger().info(f'Origin: x={map_info.origin.position.x}, y={map_info.origin.position.y}, z={map_info.origin.position.z}')
 
             # Static Transform Broadcaster를 통해 'map' 프레임을 'base_link' 프레임에 브로드캐스트
             transform = TransformStamped()
             transform.header.stamp = self.get_clock().now().to_msg()
             transform.header.frame_id = 'map'
             transform.child_frame_id = 'base_link'
+            # 'base_link'를 'map'의 원점에 고정 (필요에 따라 조정)
             transform.transform.translation.x = 0.0
             transform.transform.translation.y = 0.0
             transform.transform.translation.z = 0.0
@@ -163,13 +171,29 @@ class CleaningNode(Node):
             self.get_logger().error(f'맵 이미지를 처리하는 중 오류 발생: {e}')
             return
 
+    def publish_map(self):
+        """
+        OccupancyGrid 메시지를 퍼블리시합니다.
+        """
+        if self.map_data is None or self.map_info is None:
+            self.get_logger().error('맵 데이터가 로드되지 않았습니다. 퍼블리시할 수 없습니다.')
+            return
+
+        occupancy_grid = OccupancyGrid()
+        occupancy_grid.header.frame_id = 'map'
+        occupancy_grid.header.stamp = self.get_clock().now().to_msg()
+        occupancy_grid.info = self.map_info
+        occupancy_grid.data = self.map_data
+
+        self.map_publisher.publish(occupancy_grid)
+        self.get_logger().info('OccupancyGrid 맵을 퍼블리시하였습니다.')
+
     def get_initial_pose(self):
         """
         노드 시작 시 로봇의 초기 위치를 저장합니다.
         """
         try:
             # 'map' 프레임에서 'base_link' 프레임으로의 변환을 가져옵니다.
-            # 여기서 'base_link'가 'map' 프레임에 고정되어 있으므로, 초기 위치는 'map' 프레임의 원점이 됩니다.
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             self.initial_pose = PoseStamped()
             self.initial_pose.header.frame_id = 'map'
