@@ -1,3 +1,5 @@
+# exploration/exploration3_0.py
+
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
@@ -14,9 +16,9 @@ from collections import deque
 from slam_toolbox.srv import SaveMap  # Map saving service import
 from std_msgs.msg import String
 
-class FrontierExplorer(Node):
+class Exploration3_0(Node):
     def __init__(self):
-        super().__init__('frontier_explorer')
+        super().__init__('exploration3_0')  # Updated node name
 
         # Set logging level to DEBUG for detailed logs
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
@@ -47,8 +49,13 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
-        self.movement_threshold = 0.10  # 15 cm
-        self.movement_timeout = 12.0  # 10 seconds of no movement triggers reset
+        self.movement_threshold = 0.10  # 10 cm
+        self.movement_timeout = 12.0  # 12 seconds of no movement triggers unstucking
+
+        # Unstucking variables
+        self.unstucking = False
+        self.unstuck_attempts = 0
+        self.max_unstuck_attempts = 5
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -62,17 +69,12 @@ class FrontierExplorer(Node):
         self.navigator.wait_for_server()
         self.get_logger().info('NavigateToPose action server is ready.')
 
-        # Initialize lists to keep track of visited and failed frontiers
-        self.visited_frontiers = []
-        self.failed_frontiers = []  # List to record failed frontiers
-        self.frontier_distance_threshold = 0.1  # Consider frontiers within 10 cm as visited
-
         # Current goal position
         self.current_goal_position = None
+        self.original_goal_position = None  # To store the original frontier goal
 
         # Publisher to signal cleaning algorithm
         self.cleaning_publisher = self.create_publisher(Bool, '/cleaning', 10)
-
 
     def map_callback(self, msg):
         """
@@ -151,7 +153,15 @@ class FrontierExplorer(Node):
 
         # Proceed to send the goal
         self.current_goal_position = goal_position  # Save current goal position
+        self.original_goal_position = goal_position  # Also store as original goal
 
+        # Send navigation goal
+        self.send_navigation_goal(goal_position)
+
+    def send_navigation_goal(self, goal_position):
+        """
+        Sends a navigation goal to the specified position.
+        """
         # Create goal message
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = PoseStamped()
@@ -160,7 +170,7 @@ class FrontierExplorer(Node):
         goal_msg.pose.pose.position = goal_position
         goal_msg.pose.pose.orientation.w = 1.0  # Forward-facing orientation
 
-        self.get_logger().info(f'Navigating to frontier: ({goal_position.x:.2f}, {goal_position.y:.2f})')
+        self.get_logger().info(f'Navigating to position: ({goal_position.x:.2f}, {goal_position.y:.2f})')
 
         # Send goal
         send_goal_future = self.navigator.send_goal_async(
@@ -168,8 +178,6 @@ class FrontierExplorer(Node):
             feedback_callback=self.feedback_callback
         )
         send_goal_future.add_done_callback(self.goal_response_callback)
-
-        # Movement monitoring starts upon goal acceptance
 
     def are_frontiers_remaining(self):
         """
@@ -209,62 +217,6 @@ class FrontierExplorer(Node):
         self.get_logger().info('No frontiers larger than 10 cm remain.')
         return False  # No frontiers remain
 
-    # Remove or comment out the is_map_explored method
-    # def is_map_explored(self):
-    #     """
-    #     This method is no longer used.
-    #     """
-    #     pass
-
-    # Rest of your code remains the same
-    # ... (Include the rest of the methods as in your current code)
-
-        
-
-    def count_accessible_unknown_cells(self):
-        """
-        Calculates the number of accessible unknown cells using BFS from the robot's current position.
-        """
-        if self.map_data is None or self.map_info is None:
-            return 0
-
-        # Convert robot's current position to grid coordinates
-        robot_pose = self.get_robot_pose()
-        if robot_pose is None:
-            self.get_logger().warn('Unable to get robot position, cannot calculate accessible unknown cells.')
-            return 0
-
-        robot_grid_x = int((robot_pose.x - self.map_info.origin.position.x) / self.map_info.resolution)
-        robot_grid_y = int((robot_pose.y - self.map_info.origin.position.y) / self.map_info.resolution)
-
-        height, width = self.map_data.shape
-        if not (0 <= robot_grid_x < width and 0 <= robot_grid_y < height):
-            self.get_logger().warn('Robot grid position is out of map bounds.')
-            return 0
-
-        visited = np.zeros((height, width), dtype=bool)
-        queue = deque()
-        queue.append((robot_grid_x, robot_grid_y))
-        visited[robot_grid_y, robot_grid_x] = True
-
-        accessible_unknown = 0
-
-        while queue:
-            x, y = queue.popleft()
-
-            neighbors = self.get_neighbors(x, y)
-            for nx, ny in neighbors:
-                if not visited[ny, nx]:
-                    if self.map_data[ny, nx] == 0:  # Free space
-                        visited[ny, nx] = True
-                        queue.append((nx, ny))
-                    elif self.map_data[ny, nx] == -1:  # Unknown space
-                        accessible_unknown += 1
-                        visited[ny, nx] = True  # Mark as visited to prevent double-counting
-
-        self.get_logger().info(f'Accessible unknown cells: {accessible_unknown}')
-        return accessible_unknown
-
     def detect_frontiers(self):
         """
         Detects frontier points in the map.
@@ -295,7 +247,9 @@ class FrontierExplorer(Node):
         return frontier_points
 
     def cluster_frontiers(self, frontiers):
-
+        """
+        Clusters frontier points using DBSCAN and filters out small clusters.
+        """
         if not frontiers:
             self.get_logger().warn('No frontiers to cluster.')
             return []
@@ -332,55 +286,39 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
 
-
         return clustered_frontiers
 
     def select_frontier(self, frontiers):
         """
-        Selects the closest unvisited frontier based on the robot's current position.
+        Selects the closest frontier based on the robot's current position.
         """
         robot_position = self.get_robot_pose()
         if robot_position is None:
             self.get_logger().warning('Unable to get robot position, selecting first frontier.')
             return frontiers[0] if frontiers else None
 
-        valid_frontiers = []
         distances = []
         for frontier in frontiers:
-            # Check if the frontier has been visited or failed
-            if self.is_frontier_visited(frontier) or self.is_frontier_failed(frontier):
-                self.get_logger().debug(f'Frontier ({frontier.x:.2f}, {frontier.y:.2f}) has already been visited or failed.')
-                continue
-
             dx = frontier.x - robot_position.x
             dy = frontier.y - robot_position.y
             distance = math.hypot(dx, dy)
             self.get_logger().debug(f'Frontier ({frontier.x:.2f}, {frontier.y:.2f}), Distance: {distance:.2f}m')
 
             if distance >= self.min_frontier_distance:
-                valid_frontiers.append(frontier)
-                distances.append(distance)
+                distances.append((distance, frontier))
                 self.get_logger().info(f'Valid frontier ({frontier.x:.2f}, {frontier.y:.2f}), Distance: {distance:.2f}m')
             else:
                 self.get_logger().debug(f'Frontier ({frontier.x:.2f}, {frontier.y:.2f}) is too close.')
 
-        if not valid_frontiers:
+        if not distances:
             self.get_logger().info('No valid frontiers found.')
             return None
 
         # Select the closest frontier
-        min_index = np.argmin(distances)
-        selected_frontier = valid_frontiers[min_index]
-        self.visited_frontiers.append(selected_frontier)  # Mark as visited
+        distances.sort()
+        selected_frontier = distances[0][1]
         self.get_logger().info(f'Selected frontier ({selected_frontier.x:.2f}, {selected_frontier.y:.2f})')
         return selected_frontier
-
-    def is_goal_safe(self, goal_x, goal_y, safety_distance=0.5):
-        """
-        Checks if the goal position is safe by ensuring no obstacles within the safety distance.
-        """
-        # This method is not used anymore since we removed obstacle checks.
-        pass
 
     def get_neighbors(self, x, y):
         """
@@ -416,30 +354,6 @@ class FrontierExplorer(Node):
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
             self.get_logger().error(f'Unable to get robot position: {e}')
             return None
-
-    def is_frontier_visited(self, frontier):
-        """
-        Checks if the frontier has already been visited or is being attempted.
-        """
-        for visited in self.visited_frontiers:
-            dx = frontier.x - visited.x
-            dy = frontier.y - visited.y
-            distance = math.hypot(dx, dy)
-            if distance < self.frontier_distance_threshold:
-                return True
-        return False
-
-    def is_frontier_failed(self, frontier):
-        """
-        Checks if the frontier has been previously attempted and failed.
-        """
-        for failed in self.failed_frontiers:
-            dx = frontier.x - failed.x
-            dy = frontier.y - failed.y
-            distance = math.hypot(dx, dy)
-            if distance < self.frontier_distance_threshold:
-                return True
-        return False
 
     def goal_response_callback(self, future):
         """
@@ -484,6 +398,8 @@ class FrontierExplorer(Node):
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Reached the goal successfully!')
             self.retry_count = 0  # Reset retry count on success
+            self.unstucking = False  # Reset unstucking flag
+            self.unstuck_attempts = 0  # Reset unstuck attempts
         else:
             self.get_logger().info(f'Goal failed with status: {status}')
             self.handle_goal_failure()
@@ -503,9 +419,7 @@ class FrontierExplorer(Node):
         """
         self.retry_count += 1
         if self.retry_count >= self.max_retries:
-            self.get_logger().warn('Maximum retry attempts reached. Recording frontier as failed and moving to next frontier.')
-            if self.current_goal_position is not None:
-                self.failed_frontiers.append(self.current_goal_position)  # Record as failed
+            self.get_logger().warn('Maximum retry attempts reached. Moving to next frontier.')
             self.retry_count = 0  # Reset retry count
             self.current_goal_position = None  # Reset current goal position
             self.exploring = False
@@ -515,7 +429,7 @@ class FrontierExplorer(Node):
         else:
             self.get_logger().info('Retrying the same frontier.')
             self.exploring = False  # Reset flag to allow retry
-            self.find_and_navigate_to_frontier()
+            self.send_navigation_goal(self.current_goal_position)
 
     def feedback_callback(self, feedback_msg):
         """
@@ -523,37 +437,6 @@ class FrontierExplorer(Node):
         Currently unused but can be implemented as needed.
         """
         pass
-
-    def cancel_current_goal(self):
-        """
-        Resets the current goal and exploration state.
-        """
-        self.get_logger().info('Resetting current goal and exploration state.')
-        self.current_goal = None
-        self.stop_robot()
-        self.stop_movement_monitoring()
-        self.last_moving_position = None
-        self.last_moving_time = None
-        self.exploring = False  # Allow find_and_navigate_to_frontier to proceed
-        # Proceed to find and navigate to a new frontier
-        self.find_and_navigate_to_frontier()
-
-    def cancel_goal_response_callback(self, future):
-        """
-        Processes the response to the goal cancellation request.
-        """
-        try:
-            response = future.result()
-            if response.goals_canceling:
-                self.get_logger().info('All active goals have been canceled.')
-            else:
-                self.get_logger().info('No active goals were found to cancel.')
-        except Exception as e:
-            self.get_logger().error(f'Failed to cancel goals: {e}')
-
-        # Reset exploration flag and attempt to navigate to the next frontier
-        self.exploring = False
-        self.find_and_navigate_to_frontier()
 
     def shutdown(self):
         """
@@ -623,9 +506,6 @@ class FrontierExplorer(Node):
             self.movement_timer.cancel()
             self.get_logger().debug('Canceled movement monitoring timer.')
 
-        # Cancel other timers if any
-        # e.g., self.another_timer.cancel()
-
     def stop_robot(self):
         """
         Publishes zero velocities to stop the robot.
@@ -668,7 +548,7 @@ class FrontierExplorer(Node):
     def check_movement_callback(self):
         """
         Periodically checks if the robot has moved sufficiently.
-        Resets the goal and seeks a new frontier if not.
+        If not, attempts to unstuck the robot.
         """
         self.get_logger().debug('check_movement_callback called')
         current_time = self.get_clock().now()
@@ -688,6 +568,18 @@ class FrontierExplorer(Node):
             self.last_moving_position = current_position
             self.last_moving_time = None  # Reset
             self.get_logger().debug('The robot has moved sufficiently.')
+
+            # If we were unstucking, and robot has moved, reset unstucking
+            if self.unstucking:
+                self.unstucking = False
+                self.unstuck_attempts = 0
+                self.get_logger().debug('Robot has moved after unstucking.')
+
+                # Resend the original frontier goal
+                if self.original_goal_position is not None:
+                    self.get_logger().info('Resending original frontier goal.')
+                    self.send_navigation_goal(self.original_goal_position)
+                    self.original_goal_position = None  # Reset
         else:
             if self.last_moving_time is None:
                 # Start the movement timeout timer
@@ -700,13 +592,121 @@ class FrontierExplorer(Node):
             self.get_logger().debug(f'The robot has not moved sufficiently for {time_since_last_move:.2f} seconds.')
 
             if time_since_last_move >= self.movement_timeout:
-                # Movement timeout exceeded; reset goal and seek new frontier
-                self.get_logger().warn('The robot is stuck. Resetting goal and searching for next frontier.')
-                self.cancel_current_goal()
+                # Movement timeout exceeded; attempt to unstuck the robot
+                if not self.unstucking:
+                    self.get_logger().warn('The robot is stuck. Attempting to unstuck.')
+                    self.unstucking = True
+                    self.unstuck_attempts = 0
+                    self.unstuck_robot()
+                elif self.unstuck_attempts >= self.max_unstuck_attempts:
+                    self.get_logger().error('Unable to unstuck the robot after maximum attempts.')
+                    self.unstucking = False
+                    self.unstuck_attempts = 0
+                    # Decide what to do: stop the robot, shutdown, or reset
+                    self.stop_robot()
+                    self.shutdown()
+                else:
+                    # Continue unstucking
+                    self.unstuck_robot()
+
+    def unstuck_robot(self):
+        """
+        Attempts to unstuck the robot by sending a goal in the middle of the nearest two walls.
+        """
+        self.get_logger().info('Attempting to unstuck the robot.')
+
+        self.unstuck_attempts += 1
+
+        # Get robot's current grid position
+        robot_pose = self.get_robot_pose()
+        if robot_pose is None:
+            self.get_logger().warn('Unable to get robot position for unstucking.')
+            return
+
+        robot_grid_x = int((robot_pose.x - self.map_info.origin.position.x) / self.map_info.resolution)
+        robot_grid_y = int((robot_pose.y - self.map_info.origin.position.y) / self.map_info.resolution)
+
+        height, width = self.map_data.shape
+
+        # Search radius in cells
+        search_radius_cells = int(1.0 / self.map_info.resolution)  # Search within 1 meter
+
+        # Lists to hold positions of walls
+        wall_positions = []
+
+        for dy in range(-search_radius_cells, search_radius_cells + 1):
+            for dx in range(-search_radius_cells, search_radius_cells + 1):
+                x = robot_grid_x + dx
+                y = robot_grid_y + dy
+                if 0 <= x < width and 0 <= y < height:
+                    if self.map_data[y, x] == 100:  # Wall
+                        wall_positions.append((x, y))
+
+        if len(wall_positions) < 2:
+            self.get_logger().warn('Not enough walls found for unstucking.')
+            # Try sending a goal slightly behind the robot
+            unstuck_goal_x = robot_pose.x - 0.2 * self.unstuck_attempts  # Move backward more each time
+            unstuck_goal_y = robot_pose.y
+            unstuck_goal_position = Point(x=unstuck_goal_x, y=unstuck_goal_y, z=0.0)
+            self.get_logger().info(f'Sending unstuck goal to ({unstuck_goal_x:.2f}, {unstuck_goal_y:.2f})')
+            self.send_navigation_goal(unstuck_goal_position)
+            return
+
+        # Find the two nearest walls
+        wall_distances = []
+        for wx, wy in wall_positions:
+            distance = math.hypot((wx - robot_grid_x) * self.map_info.resolution,
+                                  (wy - robot_grid_y) * self.map_info.resolution)
+            wall_distances.append((distance, (wx, wy)))
+
+        wall_distances.sort()
+        nearest_walls = wall_distances[:2]
+
+        # Compute midpoint between the two walls
+        (d1, (wx1, wy1)) = nearest_walls[0]
+        (d2, (wx2, wy2)) = nearest_walls[1]
+
+        mid_x = (wx1 + wx2) / 2
+        mid_y = (wy1 + wy2) / 2
+
+        # Convert grid coordinates back to map coordinates
+        unstuck_goal_x = self.map_info.origin.position.x + (mid_x + 0.5) * self.map_info.resolution
+        unstuck_goal_y = self.map_info.origin.position.y + (mid_y + 0.5) * self.map_info.resolution
+
+        # Offset the goal slightly to the right or left
+        offset_distance = 0.2 + 0.1 * self.unstuck_attempts  # Increase offset each attempt
+
+        # Compute a vector perpendicular to the line between the walls
+        vec_x = wx2 - wx1
+        vec_y = wy2 - wy1
+        length = math.hypot(vec_x, vec_y)
+        if length == 0:
+            self.get_logger().warn('Walls are at the same position. Cannot compute offset.')
+            return
+
+        # Normalize the vector
+        vec_x /= length
+        vec_y /= length
+
+        # Perpendicular vector
+        perp_x = -vec_y
+        perp_y = vec_x
+
+        # Alternate sides each attempt
+        side = (-1) ** self.unstuck_attempts
+
+        # Offset the goal
+        unstuck_goal_x += perp_x * offset_distance * side
+        unstuck_goal_y += perp_y * offset_distance * side
+
+        # Create and send the goal
+        unstuck_goal_position = Point(x=unstuck_goal_x, y=unstuck_goal_y, z=0.0)
+        self.get_logger().info(f'Sending unstuck goal to ({unstuck_goal_x:.2f}, {unstuck_goal_y:.2f})')
+        self.send_navigation_goal(unstuck_goal_position)
 
 def main(args=None):
     rclpy.init(args=args)
-    explorer = FrontierExplorer()
+    explorer = Exploration3_0()
 
     # Use a MultiThreadedExecutor to allow timers and callbacks to run in parallel
     executor = rclpy.executors.MultiThreadedExecutor()

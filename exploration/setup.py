@@ -32,6 +32,7 @@ setup(
         'exploration2_0 = exploration.exploration2_0:main',
         'turtle_optflow = exploration.turtle_optflow:main',
         'cleaning = exploration.cleaning:main'
+        'exploration3_0 = exploration3_0:main',
         ],
     }
 )
