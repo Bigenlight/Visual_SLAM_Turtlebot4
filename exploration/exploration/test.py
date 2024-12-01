@@ -13,7 +13,6 @@ from std_msgs.msg import Bool
 from collections import deque
 from slam_toolbox.srv import SaveMap  # Map saving service import
 from std_msgs.msg import String
-from visualization_msgs.msg import Marker, MarkerArray
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -39,20 +38,17 @@ class FrontierExplorer(Node):
         self.exploring = False
         self.max_frontier_distance = 20.0  # Maximum exploration distance (meters)
         self.min_frontier_distance = 0.36  # Minimum goal distance (meters)
-        self.safety_distance = 0.1  # Safety distance (meters)
+        self.safety_distance = 0.17  # Safety distance (meters)
         self.max_retries = 3  # Maximum goal retry attempts
         self.retry_count = 0
         self.goal_timeout = 30.0  # Goal timeout (seconds)
-
-        self.no_frontier_count = 0  # Number of consecutive times no frontiers were found
-        self.max_no_frontier_retries = 5  # Maximum retries before shutdown
 
         # Movement monitoring variables
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # Check every 1 second
-        self.movement_threshold = 0.15  # 15 cm
-        self.movement_timeout = 10.0  # 10 seconds of no movement triggers reset
+        self.movement_threshold = 0.10  # 15 cm
+        self.movement_timeout = 12.0  # 10 seconds of no movement triggers reset
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -77,9 +73,7 @@ class FrontierExplorer(Node):
         # Publisher to signal cleaning algorithm
         self.cleaning_publisher = self.create_publisher(Bool, '/cleaning', 10)
 
-        # Publisher for RViz visualization markers
-        self.marker_publisher = self.create_publisher(MarkerArray, 'frontier_markers', 10)
-
+ 
     def map_callback(self, msg):
         """
         Callback function for /map topic.
@@ -93,7 +87,8 @@ class FrontierExplorer(Node):
 
     def find_and_navigate_to_frontier(self):
         """
-        Detects and navigates to frontiers without shutting down prematurely.
+        Detects and navigates to frontiers. If no frontiers remain,
+        saves the map and shuts down.
         """
         if self.exploring:
             self.get_logger().debug('Already exploring. Skipping find_and_navigate_to_frontier.')
@@ -109,60 +104,52 @@ class FrontierExplorer(Node):
         if not frontiers:
             self.get_logger().info('No frontiers detected.')
 
-            # 2. Check if the map is fully explored
-            if self.is_map_explored():
-                self.get_logger().info('Map is sufficiently explored. Exploration complete.')
+            # Check if any frontiers remain in the entire map
+            if not self.are_frontiers_remaining():
+                self.get_logger().info('No frontiers remain in the map. Exploration complete.')
                 self.stop_robot()
                 self.shutdown()
             else:
-                self.get_logger().info('Map is not fully explored, but no frontiers found.')
+                self.get_logger().info('Frontiers remain, but none are currently detectable.')
                 self.get_logger().info('Retrying exploration...')
                 self.exploring = False  # Allow another attempt
             return  # Exit the method without shutting down
 
-        # 3. Cluster frontiers
+        # 2. Cluster frontiers
         clustered_frontiers = self.cluster_frontiers(frontiers)
 
         if not clustered_frontiers:
             self.get_logger().info('No valid frontiers after clustering.')
 
-            # 4. Check if the map is fully explored
-            if self.is_map_explored():
-                self.get_logger().info('Map is sufficiently explored. Exploration complete.')
+            # Check if any frontiers remain in the entire map
+            if not self.are_frontiers_remaining():
+                self.get_logger().info('No frontiers remain in the map. Exploration complete.')
                 self.stop_robot()
                 self.shutdown()
             else:
-                self.get_logger().info('Map is not fully explored, but no valid frontiers found.')
+                self.get_logger().info('Frontiers remain, but none are currently valid.')
                 self.get_logger().info('Retrying exploration...')
                 self.exploring = False  # Allow another attempt
             return  # Exit the method without shutting down
 
-        # 5. Select a frontier
+        # 3. Select a frontier
         goal_position = self.select_frontier(clustered_frontiers)
 
         if goal_position is None:
             self.get_logger().info('No valid frontiers found within distance constraints.')
 
-            self.no_frontier_count += 1
-            if self.no_frontier_count >= self.max_no_frontier_retries:
-                if self.is_map_explored():
-                    self.get_logger().info('Map is sufficiently explored. Exploration complete.')
-                    self.stop_robot()
-                    self.shutdown()
-                else:
-                    self.get_logger().info('Map is not fully explored, but no frontiers found.')
-                    self.stop_robot()
-                    self.shutdown()
-                return  # Exit the method without shutting down
+            # Check if any frontiers remain in the entire map
+            if not self.are_frontiers_remaining():
+                self.get_logger().info('No frontiers remain in the map. Exploration complete.')
+                self.stop_robot()
+                self.shutdown()
             else:
-                self.get_logger().info(f'No valid frontiers found. Retrying... ({self.no_frontier_count}/{self.max_no_frontier_retries})')
+                self.get_logger().info('Frontiers remain, but none are currently valid.')
+                self.get_logger().info('Retrying exploration...')
                 self.exploring = False  # Allow another attempt
-                return  # Exit the method without shutting down
-        else:
-            # 6. Reset no_frontier_count when a goal is found
-            self.no_frontier_count = 0
+            return  # Exit the method without shutting down
 
-        # 7. Proceed to send the goal
+        # Proceed to send the goal
         self.current_goal_position = goal_position  # Save current goal position
 
         # Create goal message
@@ -184,36 +171,54 @@ class FrontierExplorer(Node):
 
         # Movement monitoring starts upon goal acceptance
 
-    def is_map_explored(self):
+    def are_frontiers_remaining(self):
         """
-        Determines if the map is sufficiently explored based on unknown area ratios.
+        Checks if there are any frontiers (cells with values 0 or -1)
+        larger than 10 cm in the entire map.
         """
-        # Option 1: Override to always return False to prevent shutdown
-        #return False
-
-        # Option 2: If you prefer to keep some exploration logic, adjust the threshold
-        
         if self.map_data is None:
-            return False
+            self.get_logger().warn('Map data is not available.')
+            return True  # Assume frontiers remain if map data is unavailable
 
-        total_cells = self.map_data.size
-        unknown_cells = np.count_nonzero(self.map_data == -1)
-        unknown_ratio = unknown_cells / total_cells
+        # Combine free space and unknown space
+        frontier_mask = np.logical_or(self.map_data == 0, self.map_data == -1)
 
-        self.get_logger().info(f'Unknown area ratio: {unknown_ratio:.2f}')
+        # Label connected regions
+        from scipy.ndimage import label
 
-        # Calculate accessible unknown area ratio
-        accessible_unknown_cells = self.count_accessible_unknown_cells()
-        accessible_unknown_ratio = accessible_unknown_cells / total_cells
+        structure = np.ones((3, 3), dtype=int)  # 8-connectivity
+        labeled, num_features = label(frontier_mask, structure=structure)
 
-        self.get_logger().info(f'Total cells: {total_cells:.2%}')
-        self.get_logger().info(f'Accessible unknown area ratio: {accessible_unknown_ratio:.2%}')
+        self.get_logger().info(f'Found {num_features} potential frontiers.')
 
-        # Increase the threshold as needed
-        if accessible_unknown_ratio < 0.0005:  # 1% instead of 0.1%
-            return True
-        else:
-            return False
+        # Calculate the area (number of cells) of each connected region
+        sizes = np.bincount(labeled.flatten())
+
+        # The background (value 0) is not a frontier
+        sizes[0] = 0
+
+        # Convert 10 cm to number of cells
+        min_cells = int(np.ceil(0.1 / self.map_info.resolution))
+
+        # Check if any region is larger than min_cells
+        for size in sizes:
+            if size >= min_cells:
+                self.get_logger().info(f'Frontier of size {size} cells found.')
+                return True  # Frontiers remain
+
+        self.get_logger().info('No frontiers larger than 10 cm remain.')
+        return False  # No frontiers remain
+
+    # Remove or comment out the is_map_explored method
+    # def is_map_explored(self):
+    #     """
+    #     This method is no longer used.
+    #     """
+    #     pass
+
+    # Rest of your code remains the same
+    # ... (Include the rest of the methods as in your current code)
+
         
 
     def count_accessible_unknown_cells(self):
@@ -290,10 +295,7 @@ class FrontierExplorer(Node):
         return frontier_points
 
     def cluster_frontiers(self, frontiers):
-        """
-        Clusters frontier points using DBSCAN and filters out small clusters.
-        Publishes markers for RViz visualization.
-        """
+
         if not frontiers:
             self.get_logger().warn('No frontiers to cluster.')
             return []
@@ -330,8 +332,6 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
 
-        # Publish markers for RViz
-        self.publish_frontier_markers(clustered_frontiers)
 
         return clustered_frontiers
 
@@ -703,33 +703,6 @@ class FrontierExplorer(Node):
                 # Movement timeout exceeded; reset goal and seek new frontier
                 self.get_logger().warn('The robot is stuck. Resetting goal and searching for next frontier.')
                 self.cancel_current_goal()
-
-    # Visualization methods
-    def publish_frontier_markers(self, frontiers):
-        """
-        Publishes markers for frontiers for visualization in RViz.
-        """
-        marker_array = MarkerArray()
-        for idx, frontier in enumerate(frontiers):
-            marker = Marker()
-            marker.header.frame_id = 'map'
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = 'frontiers'
-            marker.id = idx
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position = frontier
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.2
-            marker.scale.y = 0.2
-            marker.scale.z = 0.2
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker_array.markers.append(marker)
-        self.marker_publisher.publish(marker_array)
-        self.get_logger().debug('Published frontier markers to RViz.')
 
 def main(args=None):
     rclpy.init(args=args)
