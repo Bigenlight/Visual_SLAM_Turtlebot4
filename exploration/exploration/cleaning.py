@@ -2,10 +2,11 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid, MapMetaData
-from geometry_msgs.msg import PoseStamped, Point, Twist
+from geometry_msgs.msg import PoseStamped, Point, Twist, TransformStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from action_msgs.msg import GoalStatus
 from visualization_msgs.msg import Marker, MarkerArray
 import numpy as np
@@ -50,6 +51,9 @@ class CleaningNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # Static Transform Broadcaster 초기화
+        self.static_broadcaster = StaticTransformBroadcaster(self)
+
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
         self.marker_publisher = self.create_publisher(MarkerArray, 'cleaning_markers', 10)
 
@@ -80,13 +84,16 @@ class CleaningNode(Node):
         # YAML에서 필요한 정보 추출
         try:
             image_path = map_yaml['image']
-            resolution = map_yaml['resolution']
+            resolution = float(map_yaml['resolution'])
             origin = map_yaml['origin']
             negate = map_yaml.get('negate', 0)
             occupied_thresh = map_yaml.get('occupied_thresh', 0.65)
             free_thresh = map_yaml.get('free_thresh', 0.196)
         except KeyError as e:
             self.get_logger().error(f'맵 YAML 파일에서 키를 찾을 수 없습니다: {e}')
+            return
+        except ValueError as e:
+            self.get_logger().error(f'맵 YAML 파일의 값 형식이 올바르지 않습니다: {e}')
             return
 
         # 이미지 파일의 절대 경로 계산
@@ -123,9 +130,10 @@ class CleaningNode(Node):
             map_info.resolution = resolution
             map_info.width = width
             map_info.height = height
-            map_info.origin.position.x = origin[0]
-            map_info.origin.position.y = origin[1]
-            map_info.origin.position.z = origin[2]
+            # origin을 float으로 변환
+            map_info.origin.position.x = float(origin[0])
+            map_info.origin.position.y = float(origin[1])
+            map_info.origin.position.z = float(origin[2])
             map_info.origin.orientation.x = 0.0
             map_info.origin.orientation.y = 0.0
             map_info.origin.orientation.z = 0.0
@@ -135,6 +143,21 @@ class CleaningNode(Node):
             self.map_info = map_info
 
             self.get_logger().info(f'맵을 성공적으로 로드하였습니다: {width}x{height}, 해상도={resolution}m/pix')
+
+            # Static Transform Broadcaster를 통해 'map' 프레임을 'base_link' 프레임에 브로드캐스트
+            transform = TransformStamped()
+            transform.header.stamp = self.get_clock().now().to_msg()
+            transform.header.frame_id = 'map'
+            transform.child_frame_id = 'base_link'
+            transform.transform.translation.x = 0.0
+            transform.transform.translation.y = 0.0
+            transform.transform.translation.z = 0.0
+            transform.transform.rotation.x = 0.0
+            transform.transform.rotation.y = 0.0
+            transform.transform.rotation.z = 0.0
+            transform.transform.rotation.w = 1.0
+            self.static_broadcaster.sendTransform(transform)
+            self.get_logger().info('Static Transform Broadcaster를 통해 "map" 프레임을 "base_link" 프레임에 브로드캐스트하였습니다.')
 
         except Exception as e:
             self.get_logger().error(f'맵 이미지를 처리하는 중 오류 발생: {e}')
@@ -146,6 +169,7 @@ class CleaningNode(Node):
         """
         try:
             # 'map' 프레임에서 'base_link' 프레임으로의 변환을 가져옵니다.
+            # 여기서 'base_link'가 'map' 프레임에 고정되어 있으므로, 초기 위치는 'map' 프레임의 원점이 됩니다.
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             self.initial_pose = PoseStamped()
             self.initial_pose.header.frame_id = 'map'
