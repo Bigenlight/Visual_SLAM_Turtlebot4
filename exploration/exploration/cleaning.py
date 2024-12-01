@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, MapMetaData
 from geometry_msgs.msg import PoseStamped, Point, Twist
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
@@ -10,6 +10,9 @@ from action_msgs.msg import GoalStatus
 from visualization_msgs.msg import Marker, MarkerArray
 import numpy as np
 import math
+import yaml
+import os
+from PIL import Image
 
 # "wall_follow" 액션 메시지 임포트 (실제 패키지와 액션 이름으로 수정 필요)
 # 예시: from your_wall_follow_package.action import WallFollow
@@ -27,9 +30,9 @@ class CleaningNode(Node):
         self.cleaning_subscriber = self.create_subscription(
             Bool, '/cleaning', self.cleaning_callback, 10)
 
-        # /map 토픽 구독
-        self.map_subscriber = self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, 10)
+        # /map 토픽 구독 제거
+        # self.map_subscriber = self.create_subscription(
+        #     OccupancyGrid, '/map', self.map_callback, 10)
 
         # "wall_follow" 액션 클라이언트 초기화
         self.wall_follow_client = ActionClient(self, WallFollow, 'wall_follow')
@@ -50,8 +53,92 @@ class CleaningNode(Node):
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
         self.marker_publisher = self.create_publisher(MarkerArray, 'cleaning_markers', 10)
 
+        # 맵 파일 경로 설정
+        self.map_file_path = '/home/rokey/4_ws/map.yaml'  # 실제 맵 파일 경로로 수정하세요
+
+        # 맵 데이터 로드
+        self.load_map(self.map_file_path)
+
         # 초기 위치 저장
         self.get_initial_pose()
+
+    def load_map(self, map_file_path):
+        """
+        지정된 경로에서 맵 파일을 로드하여 self.map_data와 self.map_info를 설정합니다.
+        """
+        if not os.path.exists(map_file_path):
+            self.get_logger().error(f'맵 파일을 찾을 수 없습니다: {map_file_path}')
+            return
+
+        try:
+            with open(map_file_path, 'r') as file:
+                map_yaml = yaml.safe_load(file)
+        except Exception as e:
+            self.get_logger().error(f'맵 YAML 파일을 로드하는 중 오류 발생: {e}')
+            return
+
+        # YAML에서 필요한 정보 추출
+        try:
+            image_path = map_yaml['image']
+            resolution = map_yaml['resolution']
+            origin = map_yaml['origin']
+            negate = map_yaml.get('negate', 0)
+            occupied_thresh = map_yaml.get('occupied_thresh', 0.65)
+            free_thresh = map_yaml.get('free_thresh', 0.196)
+        except KeyError as e:
+            self.get_logger().error(f'맵 YAML 파일에서 키를 찾을 수 없습니다: {e}')
+            return
+
+        # 이미지 파일의 절대 경로 계산
+        map_dir = os.path.dirname(map_file_path)
+        image_full_path = os.path.join(map_dir, image_path)
+
+        if not os.path.exists(image_full_path):
+            self.get_logger().error(f'맵 이미지 파일을 찾을 수 없습니다: {image_full_path}')
+            return
+
+        try:
+            # 이미지 로드 (흑백 이미지로 가정)
+            img = Image.open(image_full_path)
+            img = img.convert('L')  # 흑백으로 변환
+            map_array = np.array(img)
+
+            # 픽셀 값을 OccupancyGrid 값으로 변환
+            # 일반적으로 0 (흰색) = free, 100 (검은색) = occupied, -1 = unknown
+            map_data = []
+            for row in map_array:
+                for pixel in row:
+                    if pixel == 255:
+                        map_data.append(0)
+                    elif pixel == 0:
+                        map_data.append(100)
+                    else:
+                        map_data.append(-1)
+
+            height, width = map_array.shape
+
+            # OccupancyGrid 메타데이터 설정
+            map_info = MapMetaData()
+            map_info.map_load_time = self.get_clock().now().to_msg()
+            map_info.resolution = resolution
+            map_info.width = width
+            map_info.height = height
+            map_info.origin.position.x = origin[0]
+            map_info.origin.position.y = origin[1]
+            map_info.origin.position.z = origin[2]
+            map_info.origin.orientation.x = 0.0
+            map_info.origin.orientation.y = 0.0
+            map_info.origin.orientation.z = 0.0
+            map_info.origin.orientation.w = 1.0
+
+            self.map_data = map_data
+            self.map_info = map_info
+
+            self.get_logger().info(f'맵을 성공적으로 로드하였습니다: {width}x{height}, 해상도={resolution}m/pix')
+
+        except Exception as e:
+            self.get_logger().error(f'맵 이미지를 처리하는 중 오류 발생: {e}')
+            return
 
     def get_initial_pose(self):
         """
@@ -83,13 +170,14 @@ class CleaningNode(Node):
         else:
             self.get_logger().info('잘못된 청소 신호를 수신하였습니다.')
 
-    def map_callback(self, msg):
-        """
-        /map 토픽의 콜백 함수.
-        맵 데이터를 업데이트합니다.
-        """
-        self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
-        self.map_info = msg.info
+    # map_callback 제거
+    # def map_callback(self, msg):
+    #     """
+    #     /map 토픽의 콜백 함수.
+    #     맵 데이터를 업데이트합니다.
+    #     """
+    #     self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
+    #     self.map_info = msg.info
 
     def start_cleaning(self):
         """
