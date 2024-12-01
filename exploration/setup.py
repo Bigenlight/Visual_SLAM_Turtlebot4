@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 import os
 from glob import glob
 
@@ -7,14 +7,14 @@ package_name = 'exploration'
 setup(
     name=package_name,
     version='0.0.1',
-    packages=[package_name],
+    packages=find_packages(),
     data_files=[
         # Install package.xml
         ('share/' + package_name, ['package.xml']),
         # Include launch files if any
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
-    install_requires=['setuptools', 'numpy', 'scikit-image', 'pyyaml', 'Pillow'],
+    install_requires=['setuptools', 'numpy', 'scikit-image', 'pyyaml', 'Pillow','transforms3d'],
     zip_safe=True,
     maintainer='theo',
     maintainer_email='tpingouin@gmail.com',
@@ -30,6 +30,7 @@ setup(
             'turtle_optflow = exploration.turtle_optflow:main',
             'cleaning = exploration.cleaning:main',
             'exploration3_0 = exploration.exploration3_0:main',
+            'cleaning_test = exploration.cleaning_test:main'
         ],
     }
 )

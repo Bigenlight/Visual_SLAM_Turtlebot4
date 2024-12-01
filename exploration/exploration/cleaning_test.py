@@ -1,22 +1,25 @@
+#!/usr/bin/env python3
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
-from nav_msgs.msg import OccupancyGrid, MapMetaData
-from geometry_msgs.msg import PoseStamped, Point, Twist, TransformStamped, Quaternion
+from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
+from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped, Point
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from action_msgs.msg import GoalStatus
 from visualization_msgs.msg import Marker, MarkerArray
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+from rclpy.qos import QoSPresetProfiles
 import numpy as np
 import math
 import yaml
 import os
 from PIL import Image
 from irobot_create_msgs.action import WallFollow, Dock
-import transformations
-
+import transforms3d
 
 
 class CleaningNode(Node):
@@ -26,9 +29,19 @@ class CleaningNode(Node):
         # 로깅 레벨 설정
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.INFO)
 
-        # /cleaning 토픽 구독
+        # /cleaning 토픽 구독 (QoS 설정)
+        qos_cleaning = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
         self.cleaning_subscriber = self.create_subscription(
-            Bool, '/cleaning', self.cleaning_callback, 10)
+            Bool, '/cleaning', self.cleaning_callback, qos_cleaning)
+
+        # /odom 토픽 구독 (QoS 설정: SENSOR_DATA)
+        qos_odom = QoSPresetProfiles.get_from_short_key('sensor_data')
+        self.odom_subscriber = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, qos_odom)
 
         # "wall_follow" 액션 클라이언트 초기화
         self.wall_follow_client = ActionClient(self, WallFollow, 'wall_follow')
@@ -43,11 +56,21 @@ class CleaningNode(Node):
         self.map_data = None
         self.map_info = None
         self.cleaning_started = False
-        self.initial_pose = self.create_initial_pose()  # 초기 위치 설정
+        self.initial_pose = self.set_initial_pose()  # 초기 위치 설정
 
         self.state = 'idle'  # 현재 상태: idle, wall_following, coverage_cleaning, docking
         self.coverage_waypoints = []  # 커버리지 경로 웨이포인트 리스트
         self.current_waypoint_index = 0  # 현재 진행 중인 웨이포인트 인덱스
+
+        # 위치 추적을 위한 변수
+        self.current_position = None
+        self.start_position = None
+        self.previous_position = None
+        self.total_distance = 0.0
+
+        # 벽 따라기 종료 조건 파라미터
+        self.return_distance_threshold = 0.5  # 시작 지점으로부터의 거리 임계값 (미터)
+        self.max_wall_follow_distance = 20.0  # 벽 따라기 최대 누적 이동 거리 (미터)
 
         # TF2 Buffer 및 Listener 초기화
         self.tf_buffer = Buffer()
@@ -57,13 +80,23 @@ class CleaningNode(Node):
         self.static_broadcaster = StaticTransformBroadcaster(self)
 
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
-        self.marker_publisher = self.create_publisher(MarkerArray, 'cleaning_markers', 10)
+        qos_marker = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
+        self.marker_publisher = self.create_publisher(MarkerArray, 'cleaning_markers', qos_marker)
 
         # OccupancyGrid 퍼블리셔 초기화
-        self.map_publisher = self.create_publisher(OccupancyGrid, 'map', 10)
+        qos_map = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
+        self.map_publisher = self.create_publisher(OccupancyGrid, 'map', qos_map)
 
         # 맵 파일 경로 설정
-        self.map_file_path = '/home/theo/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
+        self.map_file_path = '/home/rokey/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
 
         # 맵 데이터 로드
         self.load_map(self.map_file_path)
@@ -71,22 +104,66 @@ class CleaningNode(Node):
         # 맵 퍼블리시
         self.publish_map()
 
-    def create_initial_pose(self):
+    def set_initial_pose(self):
         """
-        고정된 초기 위치를 생성합니다.
+        코드 내에서 직접 초기 위치를 설정합니다.
         """
         initial_pose = PoseStamped()
         initial_pose.header.frame_id = 'map'
         initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = -0.04207669022787795
-        initial_pose.pose.position.y = -0.5618299323325002
+        initial_pose.pose.position.x = 7.607888698577881
+        initial_pose.pose.position.y = 3.164588689804077
         initial_pose.pose.position.z = 0.0
         initial_pose.pose.orientation.x = 0.0
         initial_pose.pose.orientation.y = 0.0
-        initial_pose.pose.orientation.z = -0.9907592678801764
-        initial_pose.pose.orientation.w = 0.13563212417984447
-        self.get_logger().info(f'초기 위치 설정: ({initial_pose.pose.position.x:.2f}, {initial_pose.pose.position.y:.2f})')
+        initial_pose.pose.orientation.z = -0.3586598015541359
+        initial_pose.pose.orientation.w = 0.9334683426603967
+        self.get_logger().info(f'초기 위치 설정: (x={initial_pose.pose.position.x:.2f}, y={initial_pose.pose.position.y:.2f})')
         return initial_pose
+
+    def compute_map_to_odom_transform(self):
+        """
+        initial_pose를 기반으로 map->odom 변환을 계산합니다.
+        """
+        # initial_pose에서 위치와 방향 추출
+        p = self.initial_pose.pose.position
+        q = self.initial_pose.pose.orientation
+
+        # 쿼터니언을 회전 행렬로 변환 (transforms3d는 [w, x, y, z] 순서 사용)
+        quat = [q.w, q.x, q.y, q.z]
+        rot_matrix = transforms3d.quaternions.quat2mat(quat)
+
+        # 회전 행렬의 전치로 역회전 계산
+        inv_rot_matrix = rot_matrix.T
+
+        # 위치 벡터 생성
+        position_vector = np.array([p.x, p.y, p.z])
+
+        # 역변환된 위치 계산
+        inv_translation = -np.dot(inv_rot_matrix, position_vector)
+
+        # 쿼터니언의 켤레로 역회전 계산
+        inv_quat = [q.w, -q.x, -q.y, -q.z]
+
+        # 역변환된 쿼터니언을 Quaternion 메시지로 변환
+        inv_q = Quaternion(
+            x=inv_quat[1],
+            y=inv_quat[2],
+            z=inv_quat[3],
+            w=inv_quat[0]
+        )
+
+        # TransformStamped 메시지 생성
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = 'map'
+        transform.child_frame_id = 'odom'
+        transform.transform.translation.x = inv_translation[0]
+        transform.transform.translation.y = inv_translation[1]
+        transform.transform.translation.z = inv_translation[2]
+        transform.transform.rotation = inv_q
+
+        return transform
 
     def load_map(self, map_file_path):
         """
@@ -167,21 +244,10 @@ class CleaningNode(Node):
             self.get_logger().info(f'맵을 성공적으로 로드하였습니다: {width}x{height}, 해상도={resolution}m/pix')
             self.get_logger().info(f'Origin: x={map_info.origin.position.x}, y={map_info.origin.position.y}, z={map_info.origin.position.z}')
 
-            # Static Transform Broadcaster를 통해 'map' 프레임을 'odom' 프레임에 브로드캐스트
-            transform = TransformStamped()
-            transform.header.stamp = self.get_clock().now().to_msg()
-            transform.header.frame_id = 'map'
-            transform.child_frame_id = 'odom'
-            # 'odom'을 'map'의 원점에 고정 (필요에 따라 조정)
-            transform.transform.translation.x = 0.0
-            transform.transform.translation.y = 0.0
-            transform.transform.translation.z = 0.0
-            transform.transform.rotation.x = 0.0
-            transform.transform.rotation.y = 0.0
-            transform.transform.rotation.z = 0.0
-            transform.transform.rotation.w = 1.0
+            # initial_pose를 기반으로 map->odom 변환 설정
+            transform = self.compute_map_to_odom_transform()
             self.static_broadcaster.sendTransform(transform)
-            self.get_logger().info('Static Transform Broadcaster를 통해 "map" 프레임을 "odom" 프레임에 브로드캐스트하였습니다.')
+            self.get_logger().info('initial_pose를 기반으로 map->odom 변환을 설정하였습니다.')
 
         except Exception as e:
             self.get_logger().error(f'맵 이미지를 처리하는 중 오류 발생: {e}')
@@ -219,10 +285,58 @@ class CleaningNode(Node):
         else:
             self.get_logger().info('잘못된 청소 신호를 수신하였습니다.')
 
+    def odom_callback(self, msg):
+        """
+        /odom 토픽의 콜백 함수.
+        로봇의 현재 위치를 저장하고, 벽 따라기 종료 조건을 확인합니다.
+        """
+        # 현재 위치 업데이트
+        self.current_position = msg.pose.pose.position
+
+        if self.state == 'wall_following':
+            if self.start_position is None:
+                # 벽 따라기 시작 시 시작 위치 저장
+                self.start_position = Point()
+                self.start_position.x = self.current_position.x
+                self.start_position.y = self.current_position.y
+                self.start_position.z = self.current_position.z
+                self.get_logger().info('벽 따라기를 시작합니다. 시작 위치를 저장하였습니다.')
+            else:
+                # 누적 이동 거리 계산
+                distance = self.calculate_distance(self.previous_position, self.current_position)
+                self.total_distance += distance
+
+                # 시작 위치로부터의 거리 계산
+                return_distance = self.calculate_distance(self.start_position, self.current_position)
+
+                # 종료 조건 확인
+                if return_distance <= self.return_distance_threshold and self.total_distance > 1.0:
+                    self.get_logger().info('시작 위치로 돌아왔습니다. 벽 따라기를 종료합니다.')
+                    self.cancel_wall_follow()
+                elif self.total_distance >= self.max_wall_follow_distance:
+                    self.get_logger().info('최대 이동 거리를 초과하였습니다. 벽 따라기를 종료합니다.')
+                    self.cancel_wall_follow()
+
+        # 이전 위치 업데이트
+        self.previous_position = self.current_position
+
+    def calculate_distance(self, pos1, pos2):
+        """
+        두 위치 간의 거리를 계산합니다.
+        """
+        dx = pos1.x - pos2.x
+        dy = pos1.y - pos2.y
+        return math.sqrt(dx * dx + dy * dy)
+
     def start_wall_follow(self):
         """
         벽 따라가기(wall_follow)를 시작합니다.
         """
+        # 초기화
+        self.start_position = None
+        self.previous_position = None
+        self.total_distance = 0.0
+
         # "wall_follow" 액션 서버가 준비될 때까지 대기
         self.get_logger().info('"wall_follow" 액션 서버를 기다리는 중...')
         if not self.wall_follow_client.wait_for_server(timeout_sec=10.0):
@@ -235,7 +349,8 @@ class CleaningNode(Node):
         # "wall_follow" 액션 목표 생성
         goal_msg = WallFollow.Goal()
         goal_msg.follow_side = WallFollow.Goal.FOLLOW_LEFT  # 왼쪽 벽 따라가기
-        goal_msg.max_runtime = rclpy.duration.Duration(seconds=300).to_msg()  # 최대 실행 시간 설정 (필요에 따라 조정)
+        # 최대 실행 시간을 충분히 크게 설정 (벽 따라기 종료는 Odom 콜백에서 처리)
+        goal_msg.max_runtime = rclpy.duration.Duration(seconds=3600).to_msg()
 
         # 액션 요청 보내기
         self.get_logger().info('"wall_follow" 액션을 시작합니다.')
@@ -245,12 +360,22 @@ class CleaningNode(Node):
         )
         send_goal_future.add_done_callback(self.wall_follow_goal_response_callback)
 
+    def cancel_wall_follow(self):
+        """
+        벽 따라기 액션을 취소합니다.
+        """
+        if hasattr(self, 'wall_follow_goal_handle') and self.wall_follow_goal_handle:
+            self.get_logger().info('벽 따라기 액션을 취소합니다.')
+            self.wall_follow_goal_handle.cancel_goal_async()
+        else:
+            self.get_logger().warn('벽 따라기 액션 핸들이 존재하지 않습니다.')
+
     def wall_follow_goal_response_callback(self, future):
         """
         "wall_follow" 액션 서버로부터 목표 수락 응답을 처리하는 콜백 함수입니다.
         """
-        goal_handle = future.result()
-        if not goal_handle.accepted:
+        self.wall_follow_goal_handle = future.result()
+        if not self.wall_follow_goal_handle.accepted:
             self.get_logger().error('"wall_follow" 액션 목표가 거부되었습니다.')
             self.cleaning_started = False
             self.state = 'idle'
@@ -259,17 +384,18 @@ class CleaningNode(Node):
         self.get_logger().info('"wall_follow" 액션 목표가 수락되었습니다.')
 
         # 목표 결과를 비동기로 가져옴
-        get_result_future = goal_handle.get_result_async()
+        get_result_future = self.wall_follow_goal_handle.get_result_async()
         get_result_future.add_done_callback(self.wall_follow_get_result_callback)
 
     def wall_follow_get_result_callback(self, future):
         """
         "wall_follow" 액션 서버로부터 결과를 처리하는 콜백 함수입니다.
         """
-        status = future.result().status
+        result = future.result()
+        status = result.status
 
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('"wall_follow" 액션이 성공적으로 완료되었습니다.')
+        if status == GoalStatus.STATUS_SUCCEEDED or status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().info('"wall_follow" 액션이 완료되었습니다.')
             # 커버리지 청소 시작
             self.state = 'coverage_cleaning'
             self.start_coverage_cleaning()
@@ -308,7 +434,7 @@ class CleaningNode(Node):
 
     def generate_coverage_path(self):
         """
-        부스트로피던 패스 플래닝을 사용하여 커버리지 경로를 생성합니다.
+        지그재그 패턴의 커버리지 경로를 생성합니다.
         """
         self.coverage_waypoints = []
 
@@ -380,19 +506,19 @@ class CleaningNode(Node):
         """
         yaw 값을 Quaternion으로 변환합니다.
         """
-        quaternion = tf_transformations.quaternion_from_euler(0, 0, yaw)
+        quaternion = transforms3d.euler.euler2quat(0, 0, yaw, axes='sxyz')  # [w, x, y, z]
         return Quaternion(
-            x=quaternion[0],
-            y=quaternion[1],
-            z=quaternion[2],
-            w=quaternion[3]
+            x=quaternion[1],
+            y=quaternion[2],
+            z=quaternion[3],
+            w=quaternion[0]
         )
 
     def navigate_to_waypoint(self, waypoint):
         """
         지정된 웨이포인트로 이동합니다.
         """
-        self.get_logger().info(f'웨이포인트로 이동: ({waypoint.pose.position.x:.2f}, {waypoint.pose.position.y:.2f})')
+        self.get_logger().info(f'웨이포인트로 이동: (x={waypoint.pose.position.x:.2f}, y={waypoint.pose.position.y:.2f})')
 
         # "navigate_to_pose" 액션 서버가 준비될 때까지 대기
         if not self.navigate_client.wait_for_server(timeout_sec=10.0):
@@ -482,7 +608,6 @@ class CleaningNode(Node):
         # Dock 액션에 필요한 추가 필드가 있다면 설정하세요
 
         # 액션 요청 보내기
-        self.get_logger().info('"dock" 액션을 시작합니다.')
         send_goal_future = self.dock_client.send_goal_async(
             goal_msg,
             feedback_callback=self.dock_feedback_callback
@@ -528,299 +653,6 @@ class CleaningNode(Node):
         # 필요에 따라 피드백 처리
         feedback = feedback_msg.feedback
         self.get_logger().debug('도킹 진행 중...')
-
-    def generate_coverage_path(self):
-        """
-        부스트로피던 패스 플래닝을 사용하여 커버리지 경로를 생성합니다.
-        """
-        self.coverage_waypoints = []
-
-        # 맵 정보를 사용하여 경로 생성
-        resolution = self.map_info.resolution
-        width = self.map_info.width
-        height = self.map_info.height
-        origin_x = self.map_info.origin.position.x
-        origin_y = self.map_info.origin.position.y
-
-        # 맵 데이터를 2D numpy 배열로 변환
-        map_array = np.array(self.map_data).reshape((height, width))
-
-        # 자유 공간 좌표 추출
-        free_spaces = np.argwhere(map_array == 0)
-
-        if free_spaces.size == 0:
-            self.get_logger().error('맵에 자유 공간이 없습니다.')
-            return
-
-        # 자유 공간의 최소 및 최대 좌표 계산
-        min_y, min_x = free_spaces.min(axis=0)
-        max_y, max_x = free_spaces.max(axis=0)
-
-        # 실제 좌표로 변환
-        min_x = origin_x + min_x * resolution
-        max_x = origin_x + max_x * resolution
-        min_y = origin_y + min_y * resolution
-        max_y = origin_y + max_y * resolution
-
-        # 커버리지 경로 생성 (지그재그 패턴)
-        step_size = 0.5  # 로봇의 폭보다 약간 작은 값으로 설정
-        x = min_x
-        direction = 1  # 위로 이동
-
-        while x <= max_x:
-            if direction == 1:
-                y_start = min_y
-                y_end = max_y
-            else:
-                y_start = max_y
-                y_end = min_y
-
-            # 시작점과 끝점을 생성
-            start_pose = PoseStamped()
-            start_pose.header.frame_id = 'map'
-            start_pose.header.stamp = self.get_clock().now().to_msg()
-            start_pose.pose.position.x = x
-            start_pose.pose.position.y = y_start
-            start_pose.pose.position.z = 0.0
-            start_pose.pose.orientation = self.yaw_to_quaternion(0.0 if direction == 1 else math.pi)
-
-            end_pose = PoseStamped()
-            end_pose.header.frame_id = 'map'
-            end_pose.header.stamp = self.get_clock().now().to_msg()
-            end_pose.pose.position.x = x
-            end_pose.pose.position.y = y_end
-            end_pose.pose.position.z = 0.0
-            end_pose.pose.orientation = self.yaw_to_quaternion(0.0 if direction == 1 else math.pi)
-
-            self.coverage_waypoints.append(start_pose)
-            self.coverage_waypoints.append(end_pose)
-
-            # 다음 열로 이동
-            x += step_size
-            direction *= -1  # 방향 반전
-
-    def yaw_to_quaternion(self, yaw):
-        """
-        yaw 값을 Quaternion으로 변환합니다.
-        """
-        quaternion = tf_transformations.quaternion_from_euler(0, 0, yaw)
-        return Quaternion(
-            x=quaternion[0],
-            y=quaternion[1],
-            z=quaternion[2],
-            w=quaternion[3]
-        )
-
-    def navigate_to_waypoint(self, waypoint):
-        """
-        지정된 웨이포인트로 이동합니다.
-        """
-        self.get_logger().info(f'웨이포인트로 이동: ({waypoint.pose.position.x:.2f}, {waypoint.pose.position.y:.2f})')
-
-        # "navigate_to_pose" 액션 서버가 준비될 때까지 대기
-        if not self.navigate_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error('"navigate_to_pose" 액션 서버가 준비되지 않았습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-            return
-
-        # "navigate_to_pose" 액션 목표 생성
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = waypoint
-
-        # 액션 요청 보내기
-        send_goal_future = self.navigate_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.navigate_feedback_callback
-        )
-        send_goal_future.add_done_callback(self.navigate_goal_response_callback)
-
-    def navigate_goal_response_callback(self, future):
-        """
-        "navigate_to_pose" 액션 서버로부터 목표 수락 응답을 처리하는 콜백 함수입니다.
-        """
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('"navigate_to_pose" 액션 목표가 거부되었습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-            return
-
-        self.get_logger().info('"navigate_to_pose" 액션 목표가 수락되었습니다.')
-
-        # 목표 결과를 비동기로 가져옴
-        get_result_future = goal_handle.get_result_async()
-        get_result_future.add_done_callback(self.navigate_get_result_callback)
-
-    def navigate_get_result_callback(self, future):
-        """
-        "navigate_to_pose" 액션 서버로부터 결과를 처리하는 콜백 함수입니다.
-        """
-        status = future.result().status
-
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('웨이포인트에 도착하였습니다.')
-            if self.state == 'coverage_cleaning':
-                # 다음 웨이포인트로 이동
-                self.current_waypoint_index += 1
-                if self.current_waypoint_index < len(self.coverage_waypoints):
-                    self.navigate_to_waypoint(self.coverage_waypoints[self.current_waypoint_index])
-                else:
-                    self.get_logger().info('커버리지 청소를 완료하였습니다.')
-                    # 도킹 시작
-                    self.state = 'docking'
-                    self.start_docking()
-            elif self.state == 'docking':
-                self.get_logger().info('도킹을 완료하였습니다.')
-                self.cleaning_started = False
-                self.state = 'idle'
-        else:
-            self.get_logger().warn(f'"navigate_to_pose" 액션이 실패하였습니다. 상태 코드: {status}')
-            self.cleaning_started = False
-            self.state = 'idle'
-
-    def navigate_feedback_callback(self, feedback_msg):
-        """
-        "navigate_to_pose" 액션 서버로부터 피드백을 처리하는 콜백 함수입니다.
-        """
-        # 필요에 따라 피드백 처리
-        feedback = feedback_msg.feedback
-        current_pose = feedback.current_pose.pose.position
-        self.get_logger().debug(f'현재 위치: x={current_pose.x:.2f}, y={current_pose.y:.2f}')
-
-    def start_docking(self):
-        """
-        도킹 액션을 시작합니다.
-        """
-        self.get_logger().info('"dock" 액션 서버를 기다리는 중...')
-        if not self.dock_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error('"dock" 액션 서버가 준비되지 않았습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-            return
-        self.get_logger().info('"dock" 액션 서버가 준비되었습니다.')
-
-        # "dock" 액션 목표 생성
-        goal_msg = Dock.Goal()
-        # Dock 액션에 필요한 추가 필드가 있다면 설정하세요
-
-        # 액션 요청 보내기
-        self.get_logger().info('"dock" 액션을 시작합니다.')
-        send_goal_future = self.dock_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.dock_feedback_callback
-        )
-        send_goal_future.add_done_callback(self.dock_goal_response_callback)
-
-    def dock_goal_response_callback(self, future):
-        """
-        "dock" 액션 서버로부터 목표 수락 응답을 처리하는 콜백 함수입니다.
-        """
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('"dock" 액션 목표가 거부되었습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-            return
-
-        self.get_logger().info('"dock" 액션 목표가 수락되었습니다.')
-
-        # 목표 결과를 비동기로 가져옴
-        get_result_future = goal_handle.get_result_async()
-        get_result_future.add_done_callback(self.dock_get_result_callback)
-
-    def dock_get_result_callback(self, future):
-        """
-        "dock" 액션 서버로부터 결과를 처리하는 콜백 함수입니다.
-        """
-        status = future.result().status
-
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('"dock" 액션이 성공적으로 완료되었습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-        else:
-            self.get_logger().warn(f'"dock" 액션이 실패하였습니다. 상태 코드: {status}')
-            self.cleaning_started = False
-            self.state = 'idle'
-
-    def dock_feedback_callback(self, feedback_msg):
-        """
-        "dock" 액션 서버로부터 피드백을 처리하는 콜백 함수입니다.
-        """
-        # 필요에 따라 피드백 처리
-        feedback = feedback_msg.feedback
-        self.get_logger().debug('도킹 진행 중...')
-
-    def generate_coverage_path(self):
-        """
-        부스트로피던 패스 플래닝을 사용하여 커버리지 경로를 생성합니다.
-        """
-        self.coverage_waypoints = []
-
-        # 맵 정보를 사용하여 경로 생성
-        resolution = self.map_info.resolution
-        width = self.map_info.width
-        height = self.map_info.height
-        origin_x = self.map_info.origin.position.x
-        origin_y = self.map_info.origin.position.y
-
-        # 맵 데이터를 2D numpy 배열로 변환
-        map_array = np.array(self.map_data).reshape((height, width))
-
-        # 자유 공간 좌표 추출
-        free_spaces = np.argwhere(map_array == 0)
-
-        if free_spaces.size == 0:
-            self.get_logger().error('맵에 자유 공간이 없습니다.')
-            return
-
-        # 자유 공간의 최소 및 최대 좌표 계산
-        min_y, min_x = free_spaces.min(axis=0)
-        max_y, max_x = free_spaces.max(axis=0)
-
-        # 실제 좌표로 변환
-        min_x = origin_x + min_x * resolution
-        max_x = origin_x + max_x * resolution
-        min_y = origin_y + min_y * resolution
-        max_y = origin_y + max_y * resolution
-
-        # 커버리지 경로 생성 (지그재그 패턴)
-        step_size = 0.5  # 로봇의 폭보다 약간 작은 값으로 설정
-        x = min_x
-        direction = 1  # 위로 이동
-
-        while x <= max_x:
-            if direction == 1:
-                y_start = min_y
-                y_end = max_y
-            else:
-                y_start = max_y
-                y_end = min_y
-
-            # 시작점과 끝점을 생성
-            start_pose = PoseStamped()
-            start_pose.header.frame_id = 'map'
-            start_pose.header.stamp = self.get_clock().now().to_msg()
-            start_pose.pose.position.x = x
-            start_pose.pose.position.y = y_start
-            start_pose.pose.position.z = 0.0
-            start_pose.pose.orientation = self.yaw_to_quaternion(0.0 if direction == 1 else math.pi)
-
-            end_pose = PoseStamped()
-            end_pose.header.frame_id = 'map'
-            end_pose.header.stamp = self.get_clock().now().to_msg()
-            end_pose.pose.position.x = x
-            end_pose.pose.position.y = y_end
-            end_pose.pose.position.z = 0.0
-            end_pose.pose.orientation = self.yaw_to_quaternion(0.0 if direction == 1 else math.pi)
-
-            self.coverage_waypoints.append(start_pose)
-            self.coverage_waypoints.append(end_pose)
-
-            # 다음 열로 이동
-            x += step_size
-            direction *= -1  # 방향 반전
 
     def publish_cleaning_markers(self, waypoints):
         """
@@ -848,81 +680,19 @@ class CleaningNode(Node):
         self.marker_publisher.publish(marker_array)
         self.get_logger().info('청소 경로 마커를 퍼블리시하였습니다.')
 
-    def start_docking(self):
-        """
-        도킹 액션을 시작합니다.
-        """
-        self.get_logger().info('"dock" 액션 서버를 기다리는 중...')
-        if not self.dock_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error('"dock" 액션 서버가 준비되지 않았습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-            return
-        self.get_logger().info('"dock" 액션 서버가 준비되었습니다.')
 
-        # "dock" 액션 목표 생성
-        goal_msg = Dock.Goal()
-        # Dock 액션에 필요한 추가 필드가 있다면 설정하세요
+def main(args=None):
+    rclpy.init(args=args)
+    cleaning_node = CleaningNode()
 
-        # 액션 요청 보내기
-        self.get_logger().info('"dock" 액션을 시작합니다.')
-        send_goal_future = self.dock_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.dock_feedback_callback
-        )
-        send_goal_future.add_done_callback(self.dock_goal_response_callback)
+    try:
+        rclpy.spin(cleaning_node)
+    except KeyboardInterrupt:
+        cleaning_node.get_logger().info('키보드 인터럽트가 발생하여 종료합니다.')
+    finally:
+        cleaning_node.destroy_node()
+        rclpy.shutdown()
 
-    def dock_goal_response_callback(self, future):
-        """
-        "dock" 액션 서버로부터 목표 수락 응답을 처리하는 콜백 함수입니다.
-        """
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('"dock" 액션 목표가 거부되었습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-            return
 
-        self.get_logger().info('"dock" 액션 목표가 수락되었습니다.')
-
-        # 목표 결과를 비동기로 가져옴
-        get_result_future = goal_handle.get_result_async()
-        get_result_future.add_done_callback(self.dock_get_result_callback)
-
-    def dock_get_result_callback(self, future):
-        """
-        "dock" 액션 서버로부터 결과를 처리하는 콜백 함수입니다.
-        """
-        status = future.result().status
-
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('"dock" 액션이 성공적으로 완료되었습니다.')
-            self.cleaning_started = False
-            self.state = 'idle'
-        else:
-            self.get_logger().warn(f'"dock" 액션이 실패하였습니다. 상태 코드: {status}')
-            self.cleaning_started = False
-            self.state = 'idle'
-
-    def dock_feedback_callback(self, feedback_msg):
-        """
-        "dock" 액션 서버로부터 피드백을 처리하는 콜백 함수입니다.
-        """
-        # 필요에 따라 피드백 처리
-        feedback = feedback_msg.feedback
-        self.get_logger().debug('도킹 진행 중...')
-
-    def main(args=None):
-        rclpy.init(args=args)
-        cleaning_node = CleaningNode()
-
-        try:
-            rclpy.spin(cleaning_node)
-        except KeyboardInterrupt:
-            cleaning_node.get_logger().info('키보드 인터럽트가 발생하여 종료합니다.')
-        finally:
-            cleaning_node.destroy_node()
-            rclpy.shutdown()
-
-    if __name__ == '__main__':
-        main()
+if __name__ == '__main__':
+    main()
