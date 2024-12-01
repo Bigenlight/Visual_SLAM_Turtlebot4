@@ -10,14 +10,11 @@ setup(
     packages=[package_name],
     data_files=[
         # Install package.xml
-        ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
         # Include launch files if any
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        # Include package.xml
-        ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools', 'numpy'],
+    install_requires=['setuptools', 'numpy', 'scikit-image', 'pyyaml', 'Pillow'],
     zip_safe=True,
     maintainer='theo',
     maintainer_email='tpingouin@gmail.com',
@@ -26,13 +23,13 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-        'exploration_node = exploration.exploration:main',
-        'exploration_kwi = exploration.exploration_kwi:main',
-        'test_node = exploration.test:main',
-        'exploration2_0 = exploration.exploration2_0:main',
-        'turtle_optflow = exploration.turtle_optflow:main',
-        'cleaning = exploration.cleaning:main',
-        'exploration3_0 = exploration3_0:main',
+            'exploration_node = exploration.exploration:main',
+            'exploration_kwi = exploration.exploration_kwi:main',
+            'test_node = exploration.test:main',
+            'exploration2_0 = exploration.exploration2_0:main',
+            'turtle_optflow = exploration.turtle_optflow:main',
+            'cleaning = exploration.cleaning:main',
+            'exploration3_0 = exploration3_0:main',
         ],
     }
 )
