@@ -39,10 +39,10 @@ class FrontierExplorer(Node):
         self.exploring = False
         self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
         self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
-        self.safety_distance = 0.1  # 안전 거리 (미터)
-        self.max_retries = 10  # 최대 목표 재시도 횟수
+        self.safety_distance = 0.02  # 안전 거리 (미터)
+        self.max_retries = 100  # 최대 목표 재시도 횟수
         self.retry_count = 0
-        self.goal_timeout = 60.0  # 목표 도달 타임아웃 (초)
+        self.goal_timeout = 50.0  # 목표 도달 타임아웃 (초)
 
         self.no_frontier_count = 0  # Number of consecutive times no frontiers were found
         self.max_no_frontier_retries = 10  # Maximum retries before shutdown
@@ -52,7 +52,7 @@ class FrontierExplorer(Node):
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
         self.movement_threshold = 0.1  # 10 cm
-        self.movement_timeout = 16.0  # 초 동안 이동하지 않으면 정지
+        self.movement_timeout = 14.0  # 14초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -69,7 +69,7 @@ class FrontierExplorer(Node):
         # 방문한 프론티어 목록 초기화
         self.visited_frontiers = []
         self.failed_frontiers = []  # 실패한 프론티어를 기록할 리스트
-        self.frontier_distance_threshold = 0.1  # 25 cm 이내의 프론티어는 방문한 것으로 간주
+        self.frontier_distance_threshold = 0.1  # 10 cm 이내의 프론티어는 방문한 것으로 간주
 
         # 현재 목표 위치를 저장할 변수
         self.current_goal_position = None
@@ -139,6 +139,12 @@ class FrontierExplorer(Node):
         if goal_position is None:
             self.get_logger().info('지정된 거리 범위 내에서 도달 가능하고 안전한 프론티어가 없습니다.')
 
+            # Retry including failed frontiers
+            if self.failed_frontiers:
+                self.get_logger().info('이전 실패한 프론티어를 다시 시도합니다.')
+                goal_position = self.select_frontier(clustered_frontiers, include_failed_frontiers=True)
+
+        if goal_position is None:
             self.no_frontier_count += 1
             if self.no_frontier_count >= self.max_no_frontier_retries:
                 if self.is_map_explored():
@@ -178,6 +184,216 @@ class FrontierExplorer(Node):
         send_goal_future.add_done_callback(self.goal_response_callback)
 
         # 이동 모니터링 타이머는 목표가 수락된 후에 시작됨
+
+    def detect_frontiers(self):
+        """
+        맵에서 프론티어 포인트를 탐지합니다.
+        프론티어는 적어도 두 개의 미지 셀과 인접한 자유 셀입니다.
+        """
+        if self.map_data is None:
+            self.get_logger().warn('Map data is not available.')
+            return []
+
+        height, width = self.map_data.shape
+        frontier_points = []
+
+        # 모든 자유 셀을 탐색
+        free_cells = np.argwhere(self.map_data == 0)
+
+        for cell in free_cells:
+            y, x = cell
+            neighbors = self.get_neighbors(x, y)
+            unknown_neighbors = 0
+            for nx, ny in neighbors:
+                if self.map_data[ny, nx] == -1:
+                    unknown_neighbors += 1
+            if unknown_neighbors >= 1:  # 최소 한 개의 미지 셀과 인접해야 함
+                mx, my = self.grid_to_map(x, y)
+                frontier_points.append([mx, my])
+
+        self.get_logger().info(f'Detected {len(frontier_points)} frontier points.')
+        return frontier_points
+
+    def cluster_frontiers(self, frontiers):
+        """
+        DBSCAN을 사용하여 프론티어 포인트를 클러스터링하고 작은 클러스터는 필터링합니다.
+        유효한 클러스터의 중심점을 반환합니다.
+        """
+        if not frontiers:
+            self.get_logger().warn('No frontiers to cluster.')
+            return []
+
+        # DBSCAN 파라미터 조정 가능
+        eps = 0.08
+        min_samples = 2
+
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(frontiers)
+        labels = clustering.labels_
+
+        unique_labels = set(labels)
+        clustered_frontiers = []
+
+        min_cluster_size = 2  # 클러스터의 최소 포인트 수
+
+        for label in unique_labels:
+            if label == -1:
+                # 노이즈 포인트는 제외
+                continue
+            indices = np.where(labels == label)[0]
+            cluster = np.array(frontiers)[indices]
+            cluster_size = len(cluster)
+
+            # 너무 작은 클러스터는 무시
+            if cluster_size < min_cluster_size:
+                self.get_logger().debug(f'Ignoring small cluster with label {label} of size {cluster_size}')
+                continue
+
+            # 클러스터의 중심점 계산
+            centroid = np.mean(cluster, axis=0)
+            point = Point(x=centroid[0], y=centroid[1], z=0.0)
+            clustered_frontiers.append(point)
+
+        self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
+
+        return clustered_frontiers
+
+    def select_frontier(self, frontiers, include_failed_frontiers=False):
+        """
+        방문하지 않았고 안전한 가장 가까운 프론티어를 선택합니다.
+        """
+        robot_position = self.get_robot_pose()
+        if robot_position is None:
+            self.get_logger().warning('로봇의 위치를 가져올 수 없어, 첫 번째 프론티어를 선택합니다.')
+            return frontiers[0] if frontiers else None
+
+        valid_frontiers = []
+        distances = []
+        for frontier in frontiers:
+            # 이미 방문했거나 실패한 프론티어인지 확인
+            if self.is_frontier_visited(frontier) or (not include_failed_frontiers and self.is_frontier_failed(frontier)):
+                self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 이미 방문했거나 실패한 프론티어입니다.')
+                continue
+
+            dx = frontier.x - robot_position.x
+            dy = frontier.y - robot_position.y
+            distance = math.hypot(dx, dy)
+            self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}), 거리: {distance:.2f}m')
+
+            if self.min_frontier_distance <= distance <= self.max_frontier_distance:
+                # 목표가 안전한지 확인
+                is_safe = self.is_goal_safe(frontier.x, frontier.y, self.safety_distance)
+                self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 거리 범위 내 및 안전 확인: {is_safe}')
+                if is_safe:
+                    valid_frontiers.append(frontier)
+                    distances.append(distance)
+                    self.get_logger().info(f'유효한 프론티어 ({frontier.x:.2f}, {frontier.y:.2f}), 거리: {distance:.2f}m')
+            else:
+                self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 거리 범위를 벗어났습니다.')
+
+        if not valid_frontiers:
+            self.get_logger().info('유효한 프론티어가 없습니다.')
+            return None
+
+        # 가장 가까운 프론티어 선택
+        min_index = np.argmin(distances)
+        selected_frontier = valid_frontiers[min_index]
+        self.visited_frontiers.append(selected_frontier)  # 방문한 프론티어로 추가
+        self.get_logger().info(f'선택된 프론티어 ({selected_frontier.x:.2f}, {selected_frontier.y:.2f})')
+        return selected_frontier
+
+    def is_goal_safe(self, goal_x, goal_y, safety_distance=0.1):
+        """
+        목표 위치가 안전한지 확인하여, 안전 거리 내에 장애물이 없는지 검사합니다.
+        """
+        if self.map_info is None or self.map_data is None:
+            self.get_logger().warn('Map information or data is not available for safety check.')
+            return False
+
+        # 안전 거리에 해당하는 셀 수 계산
+        num_cells = int(math.ceil(safety_distance / self.map_info.resolution))
+
+        # 목표 위치를 그리드 좌표로 변환
+        goal_grid_x = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
+        goal_grid_y = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
+
+        height, width = self.map_data.shape
+
+        # #### 여기 삭제 시도하자
+        # # 검사할 그리드 범위 정의
+        # min_x = max(goal_grid_x - num_cells, 0)
+        # max_x = min(goal_grid_x + num_cells, width - 1)
+        # min_y = max(goal_grid_y - num_cells, 0)
+        # max_y = min(goal_grid_y + num_cells, height - 1)
+
+        # # 안전 거리 내의 각 셀을 검사
+        # for y in range(min_y, max_y + 1):
+        #     for x in range(min_x, max_x + 1):
+        #         cell_value = self.map_data[y, x]
+        #         if cell_value >= 1:  # 장애물 임계값 (필요에 따라 조정)
+        #             self.get_logger().debug(f'장애물 발견: 그리드 ({x}, {y}), 값: {cell_value}')
+        #             return False
+        # #####
+        self.get_logger().debug(f'목표 ({goal_x:.2f}, {goal_y:.2f})는 안전합니다.')
+        return True
+
+    def get_neighbors(self, x, y):
+        """
+        주어진 셀의 8-연결 이웃을 반환합니다.
+        """
+        neighbors = []
+        width = self.map_data.shape[1]
+        height = self.map_data.shape[0]
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                nx = x + dx
+                ny = y + dy
+                if (dx != 0 or dy != 0) and 0 <= nx < width and 0 <= ny < height:
+                    neighbors.append((nx, ny))
+        return neighbors
+
+    def grid_to_map(self, x, y):
+        """
+        그리드 좌표를 맵 좌표로 변환합니다.
+        """
+        mx = self.map_info.origin.position.x + (x + 0.5) * self.map_info.resolution
+        my = self.map_info.origin.position.y + (y + 0.5) * self.map_info.resolution
+        return mx, my
+
+    def get_robot_pose(self):
+        """
+        로봇의 현재 위치를 'odom' 프레임에서 가져옵니다.
+        """
+        try:
+            trans = self.tf_buffer.lookup_transform('odom', 'base_link', rclpy.time.Time())
+            self.get_logger().debug(f'로봇 위치: ({trans.transform.translation.x:.2f}, {trans.transform.translation.y:.2f})')
+            return trans.transform.translation
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().error(f'로봇 위치를 가져올 수 없습니다: {e}')
+            return None
+
+    def is_frontier_visited(self, frontier):
+        """
+        프론티어가 이미 방문했는지, 또는 방문 시도 중인지를 확인합니다.
+        """
+        for visited in self.visited_frontiers:
+            dx = frontier.x - visited.x
+            dy = frontier.y - visited.y
+            distance = math.hypot(dx, dy)
+            if distance < self.frontier_distance_threshold:
+                return True
+        return False
+
+    def is_frontier_failed(self, frontier):
+        """
+        프론티어가 이미 시도했지만 실패했는지 확인합니다.
+        """
+        for failed in self.failed_frontiers:
+            dx = frontier.x - failed.x
+            dy = frontier.y - failed.y
+            distance = math.hypot(dx, dy)
+            if distance < self.frontier_distance_threshold:
+                return True
+        return False
 
     def is_map_explored(self):
         """
@@ -250,215 +466,6 @@ class FrontierExplorer(Node):
 
         self.get_logger().info(f'접근 가능한 미지 영역 수: {accessible_unknown}')
         return accessible_unknown
-
-    def detect_frontiers(self):
-        """
-        맵에서 프론티어 포인트를 탐지합니다.
-        프론티어는 적어도 두 개의 미지 셀과 인접한 자유 셀입니다.
-        """
-        if self.map_data is None:
-            self.get_logger().warn('Map data is not available.')
-            return []
-
-        height, width = self.map_data.shape
-        frontier_points = []
-
-        # 모든 자유 셀을 탐색
-        free_cells = np.argwhere(self.map_data == 0)
-
-        for cell in free_cells:
-            y, x = cell
-            neighbors = self.get_neighbors(x, y)
-            unknown_neighbors = 0
-            for nx, ny in neighbors:
-                if self.map_data[ny, nx] == -1:
-                    unknown_neighbors += 1
-            if unknown_neighbors >= 1:  # 최소 두 개의 미지 셀과 인접해야 함
-                mx, my = self.grid_to_map(x, y)
-                frontier_points.append([mx, my])
-
-        self.get_logger().info(f'Detected {len(frontier_points)} frontier points.')
-        return frontier_points
-
-    def cluster_frontiers(self, frontiers):
-        """
-        DBSCAN을 사용하여 프론티어 포인트를 클러스터링하고 작은 클러스터는 필터링합니다.
-        유효한 클러스터의 중심점을 반환합니다.
-        또한 RViz 시각화를 위해 마커를 퍼블리시합니다.
-        """
-        if not frontiers:
-            self.get_logger().warn('No frontiers to cluster.')
-            return []
-
-        # DBSCAN 파라미터 조정 가능
-        eps = 0.15
-        min_samples = 2
-
-        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(frontiers)  # min_samples를 늘려 작은 클러스터 필터링
-        labels = clustering.labels_
-
-        unique_labels = set(labels)
-        clustered_frontiers = []
-
-        min_cluster_size = 2  # 클러스터의 최소 포인트 수
-
-        for label in unique_labels:
-            if label == -1:
-                # 노이즈 포인트는 제외
-                continue
-            indices = np.where(labels == label)[0]
-            cluster = np.array(frontiers)[indices]
-            cluster_size = len(cluster)
-
-            # 너무 작은 클러스터는 무시
-            if cluster_size < min_cluster_size:
-                self.get_logger().debug(f'Ignoring small cluster with label {label} of size {cluster_size}')
-                continue
-
-            # 클러스터의 중심점 계산
-            centroid = np.mean(cluster, axis=0)
-            point = Point(x=centroid[0], y=centroid[1], z=0.0)
-            clustered_frontiers.append(point)
-
-        self.get_logger().info(f'Clustered into {len(clustered_frontiers)} valid frontiers after filtering.')
-
-        return clustered_frontiers
-
-    def select_frontier(self, frontiers):
-        """
-        방문하지 않았고 안전한 가장 가까운 프론티어를 선택합니다.
-        """
-        robot_position = self.get_robot_pose()
-        if robot_position is None:
-            self.get_logger().warning('로봇의 위치를 가져올 수 없어, 첫 번째 프론티어를 선택합니다.')
-            return frontiers[0] if frontiers else None
-
-        valid_frontiers = []
-        distances = []
-        for frontier in frontiers:
-            # 이미 방문했거나 실패한 프론티어인지 확인
-            if self.is_frontier_visited(frontier) or self.is_frontier_failed(frontier):
-                self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 이미 방문했거나 실패한 프론티어입니다.')
-                continue
-
-            dx = frontier.x - robot_position.x
-            dy = frontier.y - robot_position.y
-            distance = math.hypot(dx, dy)
-            self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}), 거리: {distance:.2f}m')
-
-            if self.min_frontier_distance <= distance <= self.max_frontier_distance:
-                # 목표가 안전한지 확인
-                is_safe = self.is_goal_safe(frontier.x, frontier.y, self.safety_distance)
-                self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 거리 범위 내 및 안전 확인: {is_safe}')
-                if is_safe:
-                    valid_frontiers.append(frontier)
-                    distances.append(distance)
-                    self.get_logger().info(f'유효한 프론티어 ({frontier.x:.2f}, {frontier.y:.2f}), 거리: {distance:.2f}m')
-            else:
-                self.get_logger().debug(f'프론티어 ({frontier.x:.2f}, {frontier.y:.2f}) 거리 범위를 벗어났습니다.')
-
-        if not valid_frontiers:
-            self.get_logger().info('유효한 프론티어가 없습니다.')
-            return None
-
-        # 가장 가까운 프론티어 선택
-        min_index = np.argmin(distances)
-        selected_frontier = valid_frontiers[min_index]
-        self.visited_frontiers.append(selected_frontier)  # 방문한 프론티어로 추가
-        self.get_logger().info(f'선택된 프론티어 ({selected_frontier.x:.2f}, {selected_frontier.y:.2f})')
-        return selected_frontier
-
-    def is_goal_safe(self, goal_x, goal_y, safety_distance=0.5):
-        """
-        목표 위치가 안전한지 확인하여, 안전 거리 내에 장애물이 없는지 검사합니다.
-        """
-        if self.map_info is None or self.map_data is None:
-            self.get_logger().warn('Map information or data is not available for safety check.')
-            return False
-
-        # 안전 거리에 해당하는 셀 수 계산
-        num_cells = int(math.ceil(safety_distance / self.map_info.resolution))
-
-        # 목표 위치를 그리드 좌표로 변환
-        goal_grid_x = int((goal_x - self.map_info.origin.position.x) / self.map_info.resolution)
-        goal_grid_y = int((goal_y - self.map_info.origin.position.y) / self.map_info.resolution)
-
-        height, width = self.map_data.shape
-
-        # 검사할 그리드 범위 정의
-        min_x = max(goal_grid_x - num_cells, 0)
-        max_x = min(goal_grid_x + num_cells, width - 1)
-        min_y = max(goal_grid_y - num_cells, 0)
-        max_y = min(goal_grid_y + num_cells, height - 1)
-
-        # 안전 거리 내의 각 셀을 검사
-        for y in range(min_y, max_y + 1):
-            for x in range(min_x, max_x + 1):
-                cell_value = self.map_data[y, x]
-                if cell_value >= 10:  # 장애물 임계값 (필요에 따라 조정)
-                    self.get_logger().debug(f'장애물 발견: 그리드 ({x}, {y}), 값: {cell_value}')
-                    return False
-        self.get_logger().debug(f'목표 ({goal_x:.2f}, {goal_y:.2f})는 안전합니다.')
-        return True
-
-    def get_neighbors(self, x, y):
-        """
-        주어진 셀의 8-연결 이웃을 반환합니다.
-        """
-        neighbors = []
-        width = self.map_data.shape[1]
-        height = self.map_data.shape[0]
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                nx = x + dx
-                ny = y + dy
-                if (dx != 0 or dy != 0) and 0 <= nx < width and 0 <= ny < height:
-                    neighbors.append((nx, ny))
-        return neighbors
-
-    def grid_to_map(self, x, y):
-        """
-        그리드 좌표를 맵 좌표로 변환합니다.
-        """
-        mx = self.map_info.origin.position.x + (x + 0.5) * self.map_info.resolution
-        my = self.map_info.origin.position.y + (y + 0.5) * self.map_info.resolution
-        return mx, my
-
-    def get_robot_pose(self):
-        """
-        로봇의 현재 위치를 'odom' 프레임에서 가져옵니다.
-        """
-        try:
-            trans = self.tf_buffer.lookup_transform('odom', 'base_link', rclpy.time.Time())
-            self.get_logger().debug(f'로봇 위치: ({trans.transform.translation.x:.2f}, {trans.transform.translation.y:.2f})')
-            return trans.transform.translation
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().error(f'로봇 위치를 가져올 수 없습니다: {e}')
-            return None
-
-    def is_frontier_visited(self, frontier):
-        """
-        프론티어가 이미 방문했는지, 또는 방문 시도 중인지를 확인합니다.
-        """
-        for visited in self.visited_frontiers:
-            dx = frontier.x - visited.x
-            dy = frontier.y - visited.y
-            distance = math.hypot(dx, dy)
-            if distance < self.frontier_distance_threshold:
-                return True
-        return False
-
-    def is_frontier_failed(self, frontier):
-        """
-        프론티어가 이미 시도했지만 실패했는지 확인합니다.
-        """
-        for failed in self.failed_frontiers:
-            dx = frontier.x - failed.x
-            dy = frontier.y - failed.y
-            distance = math.hypot(dx, dy)
-            if distance < self.frontier_distance_threshold:
-                return True
-        return False
 
     def goal_response_callback(self, future):
         """
