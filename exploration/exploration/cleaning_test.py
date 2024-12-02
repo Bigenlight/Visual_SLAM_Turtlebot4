@@ -106,6 +106,9 @@ class CleaningNode(Node):
         # 맵 퍼블리시
         self.publish_map()
 
+        # wall_follow 시작 시간을 저장할 변수 초기화
+        self.wall_follow_start_time = None  # 추가
+
     def set_initial_pose(self):
         """
         코드 내에서 직접 초기 위치를 설정합니다.
@@ -292,6 +295,14 @@ class CleaningNode(Node):
                         self.get_logger().info('최대 이동 거리를 초과하였습니다. 벽 따라기를 종료합니다.')
                         self.cancel_wall_follow()
 
+                # 30초 경과 여부 확인
+                if self.wall_follow_start_time is not None:
+                    elapsed_time = self.get_clock().now() - self.wall_follow_start_time
+                    elapsed_seconds = elapsed_time.nanoseconds / 1e9
+                    if elapsed_seconds >= 30.0:
+                        self.get_logger().info('30초가 경과하였습니다. 벽 따라기를 종료합니다.')
+                        self.cancel_wall_follow()
+
         # 이전 위치 업데이트
         self.previous_position = self.current_position
 
@@ -311,6 +322,7 @@ class CleaningNode(Node):
         self.start_position = None
         self.previous_position = None
         self.total_distance = 0.0
+        self.wall_follow_start_time = self.get_clock().now()  # 벽 따라기 시작 시간 저장
 
         # "wall_follow" 액션 서버가 준비될 때까지 대기
         self.get_logger().info('"wall_follow" 액션 서버를 기다리는 중...')
@@ -341,9 +353,20 @@ class CleaningNode(Node):
         """
         if hasattr(self, 'wall_follow_goal_handle') and self.wall_follow_goal_handle:
             self.get_logger().info('벽 따라기 액션을 취소합니다.')
-            self.wall_follow_goal_handle.cancel_goal_async()
+            cancel_future = self.wall_follow_goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(self.wall_follow_cancel_callback)
         else:
             self.get_logger().warn('벽 따라기 액션 핸들이 존재하지 않습니다.')
+
+    def wall_follow_cancel_callback(self, future):
+        """
+        벽 따라기 액션 취소 요청의 결과를 처리하는 콜백 함수입니다.
+        """
+        cancel_response = future.result()
+        if len(cancel_response.goals_canceling) > 0:
+            self.get_logger().info('"wall_follow" 액션이 성공적으로 취소되었습니다.')
+        else:
+            self.get_logger().warn('"wall_follow" 액션 취소에 실패하였습니다.')
 
     def wall_follow_goal_response_callback(self, future):
         """
