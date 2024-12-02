@@ -2,7 +2,6 @@
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
 from geometry_msgs.msg import PoseStamped, Quaternion, Point, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
@@ -18,6 +17,7 @@ import os
 from PIL import Image
 from irobot_create_msgs.action import WallFollow, Dock
 import transforms3d
+from action_msgs.msg import GoalStatus  # 추가
 import time  # 추가
 
 
@@ -28,28 +28,23 @@ class CleaningNode(Node):
         # 로깅 레벨 설정
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.INFO)
 
-        # /cleaning 토픽 구독 (QoS 설정)
-        qos_cleaning = QoSProfile(
-            depth=10,
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            durability=QoSDurabilityPolicy.VOLATILE
-        )
-        self.cleaning_subscriber = self.create_subscription(
-            Bool, '/cleaning', self.cleaning_callback, qos_cleaning)
-
         # /odom 토픽 구독 (QoS 설정: SENSOR_DATA)
         qos_odom = QoSPresetProfiles.get_from_short_key('sensor_data')
         self.odom_subscriber = self.create_subscription(
             Odometry, '/odom', self.odom_callback, qos_odom)
+        self.get_logger().info('Subscribed to /odom topic.')
 
         # "wall_follow" 액션 클라이언트 초기화
         self.wall_follow_client = ActionClient(self, WallFollow, 'wall_follow')
+        self.get_logger().info('Initialized wall_follow action client.')
 
         # "navigate_to_pose" 액션 클라이언트 초기화
         self.navigate_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.get_logger().info('Initialized navigate_to_pose action client.')
 
         # "dock" 액션 클라이언트 초기화
         self.dock_client = ActionClient(self, Dock, 'dock')
+        self.get_logger().info('Initialized dock action client.')
 
         # 변수 초기화
         self.map_data = None
@@ -59,14 +54,10 @@ class CleaningNode(Node):
         # /initialpose 퍼블리셔 초기화
         self.initial_pose_publisher = self.create_publisher(
             PoseWithCovarianceStamped, '/initialpose', 10)
+        self.get_logger().info('Initialized /initialpose publisher.')
 
-        # AMCL이 시작될 시간을 확보하기 위해 잠시 대기
-        self.get_logger().info('AMCL이 시작될 때까지 잠시 대기합니다...')
-        time.sleep(2)  # 필요에 따라 조정
-
-        # 초기 위치 설정 및 퍼블리시
-        self.initial_pose = self.set_initial_pose()
-        self.publish_initial_pose()
+        # 타이머를 사용하여 초기 위치 퍼블리시 (블로킹 방지)
+        self.create_timer(2.0, self.publish_initial_pose)  # 2초 후 초기 위치 퍼블리시
 
         self.state = 'idle'  # 현재 상태: idle, wall_following, coverage_cleaning, docking
         self.coverage_waypoints = []  # 커버리지 경로 웨이포인트 리스트
@@ -85,6 +76,7 @@ class CleaningNode(Node):
         # TF2 Buffer 및 Listener 초기화
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.get_logger().info('Initialized TF2 Buffer and Listener.')
 
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
         qos_marker = QoSProfile(
@@ -93,6 +85,7 @@ class CleaningNode(Node):
             durability=QoSDurabilityPolicy.VOLATILE
         )
         self.marker_publisher = self.create_publisher(MarkerArray, 'cleaning_markers', qos_marker)
+        self.get_logger().info('Initialized cleaning_markers publisher.')
 
         # OccupancyGrid 퍼블리셔 초기화
         qos_map = QoSProfile(
@@ -101,9 +94,11 @@ class CleaningNode(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
         )
         self.map_publisher = self.create_publisher(OccupancyGrid, 'map', qos_map)
+        self.get_logger().info('Initialized /map publisher.')
 
         # 맵 파일 경로 설정
-        self.map_file_path = '/home/theo/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
+        self.map_file_path = '/home/rokey/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
+        self.get_logger().info(f'Loading map from {self.map_file_path}')
 
         # 맵 데이터 로드
         self.load_map(self.map_file_path)
@@ -135,7 +130,7 @@ class CleaningNode(Node):
         initial_pose_msg = PoseWithCovarianceStamped()
         initial_pose_msg.header.stamp = self.get_clock().now().to_msg()
         initial_pose_msg.header.frame_id = 'map'
-        initial_pose_msg.pose.pose = self.initial_pose.pose
+        initial_pose_msg.pose.pose = self.set_initial_pose().pose
 
         # Covariance 설정 (모든 0을 0.0으로 변경)
         initial_pose_msg.pose.covariance = [
@@ -149,6 +144,9 @@ class CleaningNode(Node):
 
         self.initial_pose_publisher.publish(initial_pose_msg)
         self.get_logger().info('AMCL에 초기 위치를 퍼블리시하였습니다.')
+
+        # 초기 위치 퍼블리시 후 청소 시작
+        self.start_cleaning()
 
     def load_map(self, map_file_path):
         """
@@ -253,20 +251,13 @@ class CleaningNode(Node):
         self.map_publisher.publish(occupancy_grid)
         self.get_logger().info('OccupancyGrid 맵을 퍼블리시하였습니다.')
 
-    def cleaning_callback(self, msg):
+    def start_cleaning(self):
         """
-        /cleaning 토픽의 콜백 함수.
-        청소 시작 신호를 받으면 청소를 시작합니다.
+        맵 로드 및 초기 위치 퍼블리시 후 청소 작업을 시작합니다.
         """
-        if msg.data and not self.cleaning_started:
-            self.get_logger().info('청소 시작 신호를 수신하였습니다. 청소를 시작합니다.')
-            self.cleaning_started = True
-            self.state = 'wall_following'
-            self.start_wall_follow()
-        elif msg.data and self.cleaning_started:
-            self.get_logger().info('이미 청소가 진행 중입니다.')
-        else:
-            self.get_logger().info('잘못된 청소 신호를 수신하였습니다.')
+        self.get_logger().info('청소 작업을 시작합니다.')
+        self.state = 'wall_following'
+        self.start_wall_follow()
 
     def odom_callback(self, msg):
         """
