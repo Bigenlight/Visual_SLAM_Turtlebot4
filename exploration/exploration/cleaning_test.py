@@ -3,12 +3,11 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
-from geometry_msgs.msg import PoseStamped, Point, PoseWithCovarianceStamped, Quaternion, Pose
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, Pose
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
-from rclpy.qos import QoSPresetProfiles
 import numpy as np
 import math
 import yaml
@@ -18,6 +17,10 @@ import transforms3d
 from action_msgs.msg import GoalStatus
 from irobot_create_msgs.action import WallFollow, Dock
 from threading import Event
+from std_srvs.srv import Empty
+import tf2_ros
+from tf2_ros import TransformException
+from geometry_msgs.msg import TransformStamped
 
 class CleaningNode(Node):
     def __init__(self):
@@ -27,7 +30,11 @@ class CleaningNode(Node):
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.INFO)
 
         # /odom 토픽 구독 (QoS 설정: SENSOR_DATA)
-        qos_odom = QoSPresetProfiles.get_from_short_key('sensor_data')
+        qos_odom = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
         self.odom_subscriber = self.create_subscription(
             Odometry, '/odom', self.odom_callback, qos_odom)
         self.get_logger().info('Subscribed to /odom topic.')
@@ -85,9 +92,80 @@ class CleaningNode(Node):
         # 청소된 영역 추적을 위한 맵 초기화
         self.cleaned_map = np.zeros((self.map_info.height, self.map_info.width), dtype=np.uint8)
 
+        # TF 버퍼 및 리스너 초기화
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # /initialpose 퍼블리셔 초기화
+        self.initial_pose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped, '/initialpose', 10)
+        self.get_logger().info('Initialized /initialpose publisher.')
+
+        # 초기 위치 퍼블리시를 위한 타이머 설정
+        self.initial_pose_published = False
+        self.initial_pose_timer = self.create_timer(1.0, self.publish_initial_pose)
+        self.get_logger().info('Timer to publish initial pose has been set.')
+
         # AMCL 초기화 대기를 위한 타이머 설정
         self.amcl_wait_timer = self.create_timer(1.0, self.check_amcl_initialization)
         self.get_logger().info('Timer to check AMCL initialization has been set.')
+
+        # /global_localization 서비스 클라이언트 생성
+        self.global_localization_client = self.create_client(Empty, '/global_localization')
+
+        # 서비스 서버가 준비될 때까지 대기
+        while not self.global_localization_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('/global_localization 서비스 대기 중...')
+
+        # 글로벌 로컬라이제이션 서비스 요청
+        self.call_global_localization()
+
+    def call_global_localization(self):
+        """
+        /global_localization 서비스를 호출하여 AMCL이 글로벌 로컬라이제이션을 수행하도록 합니다.
+        """
+        self.get_logger().info('/global_localization 서비스를 호출합니다.')
+        req = Empty.Request()
+        future = self.global_localization_client.call_async(req)
+        future.add_done_callback(self.global_localization_response_callback)
+
+    def global_localization_response_callback(self, future):
+        self.get_logger().info('글로벌 로컬라이제이션 서비스 호출이 완료되었습니다.')
+
+    def publish_initial_pose(self):
+        """
+        AMCL에게 초기 위치를 알려주기 위해 /initialpose 토픽에 퍼블리시합니다.
+        """
+        if self.initial_pose_published:
+            return
+
+        # 초기 위치 설정 (로봇의 실제 초기 위치로 수정하세요)
+        initial_pose = PoseWithCovarianceStamped()
+        initial_pose.header.stamp = self.get_clock().now().to_msg()
+        initial_pose.header.frame_id = 'map'
+        initial_pose.pose.pose.position.x = 0.0  # 실제 초기 위치로 수정하세요
+        initial_pose.pose.pose.position.y = 0.0  # 실제 초기 위치로 수정하세요
+        initial_pose.pose.pose.position.z = 0.0
+        quat = transforms3d.euler.euler2quat(0, 0, 0, axes='sxyz')
+        initial_pose.pose.pose.orientation.x = quat[1]
+        initial_pose.pose.pose.orientation.y = quat[2]
+        initial_pose.pose.pose.orientation.z = quat[3]
+        initial_pose.pose.pose.orientation.w = quat[0]
+        # 공분산 설정
+        initial_pose.pose.covariance = [
+            0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.25, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0685, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0685, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0685
+        ]
+
+        self.initial_pose_publisher.publish(initial_pose)
+        self.get_logger().info('AMCL에 초기 위치를 퍼블리시하였습니다.')
+
+        self.initial_pose_published = True
+        self.initial_pose_timer.cancel()
 
     def amcl_pose_callback(self, msg):
         """
@@ -118,9 +196,8 @@ class CleaningNode(Node):
         맵 파일을 로드하여 맵 데이터를 설정합니다.
         """
         # 맵 파일 경로 설정 (파라미터로 받아오기)
-        self.declare_parameter('map_test', '/home/theo/4_ws/map_test.yaml')  # 실제 맵 경로로 수정하세요
-        map_file_path = self.get_parameter('map_test').get_parameter_value().string_value
-
+        self.declare_parameter('map_file_path', '/home/theo/4_ws/map_test.yaml')  # 실제 맵 경로로 수정하세요
+        map_file_path = self.get_parameter('map_file_path').get_parameter_value().string_value
 
         if not os.path.exists(map_file_path):
             self.get_logger().error(f'맵 파일을 찾을 수 없습니다: {map_file_path}')
@@ -167,14 +244,11 @@ class CleaningNode(Node):
             img = img.convert('L')  # 흑백으로 변환
             map_array = np.array(img)
 
-            # 맵을 수직으로 뒤집기 (flipud)
-            map_array = np.flipud(map_array)
-
             # OccupancyGrid 값으로 변환
             map_data = []
             for row in map_array:
                 for pixel in row:
-                    if pixel == 255:
+                    if pixel == 254 or pixel == 255:
                         map_data.append(0)
                     elif pixel == 0:
                         map_data.append(100)
@@ -265,7 +339,7 @@ class CleaningNode(Node):
 
     def generate_coverage_path(self):
         """
-        맵 데이터를 기반으로 커버리지 경로를 생성합니다.
+        맵 데이터를 기반으로 Boustrophedon Path Planning 알고리즘을 사용하여 커버리지 경로를 생성합니다.
         """
         self.coverage_waypoints = []
 
@@ -273,9 +347,9 @@ class CleaningNode(Node):
             self.get_logger().error('맵 정보가 없습니다. 커버리지 경로를 생성할 수 없습니다.')
             return
 
-        # 로봇의 반경을 고려하여 그리드 크기 설정
-        robot_radius = 0.34  # 로봇의 반경 (미터)
-        grid_size = robot_radius * 1.5  # 로봇이 지나갈 수 있는 여유를 두기 위해 설정
+        # 로봇의 폭을 고려하여 셀 크기 설정
+        robot_width = 0.68  # 로봇의 폭 (미터)
+        cell_size = robot_width * 0.8  # 셀 크기를 로봇 폭의 80%로 설정
 
         resolution = self.map_info.resolution
         width = self.map_info.width
@@ -285,52 +359,43 @@ class CleaningNode(Node):
 
         # 맵 데이터를 2D numpy 배열로 변환
         map_array = np.array(self.map_data).reshape((height, width))
+        map_array = np.flipud(map_array)  # 좌표계를 맞추기 위해 상하 반전
 
         # 자유 공간 좌표 추출
         free_space = np.where(map_array == 0, 1, 0)
 
-        # 로봇의 초기 위치를 기준으로 가까운 곳부터 탐색하도록 웨이포인트를 생성
-        if self.robot_initial_pose is None:
-            self.get_logger().error('로봇의 초기 위치가 설정되지 않았습니다.')
-            return
+        # 셀 크기에 따른 그리드 생성
+        num_cells_x = int((width * resolution) / cell_size)
+        num_cells_y = int((height * resolution) / cell_size)
 
-        robot_x = self.robot_initial_pose.position.x
-        robot_y = self.robot_initial_pose.position.y
+        x_coords = np.linspace(0, width - 1, num_cells_x, dtype=int)
+        y_coords = np.linspace(0, height - 1, num_cells_y, dtype=int)
 
-        # 그리드 기반 경로 생성
-        num_cells_x = int((width * resolution) / grid_size)
-        num_cells_y = int((height * resolution) / grid_size)
+        direction = 1  # 이동 방향 제어 변수
 
-        x_coords = np.linspace(origin_x, origin_x + (width - 1) * resolution, num_cells_x)
-        y_coords = np.linspace(origin_y, origin_y + (height - 1) * resolution, num_cells_y)
+        for idx_y, y in enumerate(y_coords):
+            if direction == 1:
+                x_iter = x_coords
+            else:
+                x_iter = x_coords[::-1]
 
-        # 로봇의 위치에 가장 가까운 그리드부터 시작하도록 정렬
-        waypoints = []
-        for y in y_coords:
-            for x in x_coords:
-                # 해당 좌표가 자유 공간인지 확인
-                map_x = int((x - origin_x) / resolution)
-                map_y = int((y - origin_y) / resolution)
+            for x in x_iter:
+                if free_space[y, x]:
+                    # 맵 좌표를 실제 좌표로 변환
+                    real_x = origin_x + x * resolution
+                    real_y = origin_y + y * resolution
 
-                if 0 <= map_x < width and 0 <= map_y < height:
-                    if free_space[map_y, map_x]:
-                        # 웨이포인트 생성
-                        pose = PoseStamped()
-                        pose.header.frame_id = 'map'
-                        pose.header.stamp = self.get_clock().now().to_msg()
-                        pose.pose.position.x = x
-                        pose.pose.position.y = y
-                        pose.pose.position.z = 0.0
-                        pose.pose.orientation = self.yaw_to_quaternion(0.0)
-                        waypoints.append(pose)
+                    # 웨이포인트 생성
+                    pose = PoseStamped()
+                    pose.header.frame_id = 'map'
+                    pose.header.stamp = self.get_clock().now().to_msg()
+                    pose.pose.position.x = real_x
+                    pose.pose.position.y = real_y
+                    pose.pose.position.z = 0.0
+                    pose.pose.orientation = self.yaw_to_quaternion(0.0)
+                    self.coverage_waypoints.append(pose)
 
-        # 로봇의 위치에 따라 웨이포인트를 정렬
-        waypoints.sort(key=lambda wp: math.hypot(wp.pose.position.x - robot_x, wp.pose.position.y - robot_y))
-
-        # 지그재그 패턴 적용 (선택 사항)
-        # 필요에 따라 웨이포인트의 순서를 조정할 수 있습니다.
-
-        self.coverage_waypoints = waypoints
+            direction *= -1  # 방향 반전
 
     def yaw_to_quaternion(self, yaw):
         """
