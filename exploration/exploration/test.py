@@ -40,7 +40,7 @@ class FrontierExplorer(Node):
         self.max_frontier_distance = 20.0  # 최대 탐사 거리 (미터)
         self.min_frontier_distance = 0.36  # 최소 목표 거리 (미터, 허용 오차)
         self.safety_distance = 0.02  # 안전 거리 (미터)
-        self.max_retries = 100  # 최대 목표 재시도 횟수
+        self.max_retries = 10  # 최대 목표 재시도 횟수
         self.retry_count = 0
         self.goal_timeout = 50.0  # 목표 도달 타임아웃 (초)
 
@@ -51,7 +51,7 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
-        self.movement_threshold = 0.1  # 10 cm
+        self.movement_threshold = 0.13  # 10 cm
         self.movement_timeout = 14.0  # 14초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
@@ -357,7 +357,7 @@ class FrontierExplorer(Node):
         # for y in range(min_y, max_y + 1):
         #     for x in range(min_x, max_x + 1):
         #         cell_value = self.map_data[y, x]
-        #         if cell_value >= 1:  # 장애물 임계값 (필요에 따라 조정)
+        #         if cell_value >= 50:  # 장애물 임계값 (필요에 따라 조정)
         #             self.get_logger().debug(f'장애물 발견: 그리드 ({x}, {y}), 값: {cell_value}')
         #             return False
         # #####
