@@ -277,19 +277,20 @@ class CleaningNode(Node):
                 self.get_logger().info('벽 따라기를 시작합니다. 시작 위치를 저장하였습니다.')
             else:
                 # 누적 이동 거리 계산
-                distance = self.calculate_distance(self.previous_position, self.current_position)
-                self.total_distance += distance
+                if self.previous_position is not None:
+                    distance = self.calculate_distance(self.previous_position, self.current_position)
+                    self.total_distance += distance
 
-                # 시작 위치로부터의 거리 계산
-                return_distance = self.calculate_distance(self.start_position, self.current_position)
+                    # 시작 위치로부터의 거리 계산
+                    return_distance = self.calculate_distance(self.start_position, self.current_position)
 
-                # 종료 조건 확인
-                if return_distance <= self.return_distance_threshold and self.total_distance > 1.0:
-                    self.get_logger().info('시작 위치로 돌아왔습니다. 벽 따라기를 종료합니다.')
-                    self.cancel_wall_follow()
-                elif self.total_distance >= self.max_wall_follow_distance:
-                    self.get_logger().info('최대 이동 거리를 초과하였습니다. 벽 따라기를 종료합니다.')
-                    self.cancel_wall_follow()
+                    # 종료 조건 확인
+                    if return_distance <= self.return_distance_threshold and self.total_distance > 1.0:
+                        self.get_logger().info('시작 위치로 돌아왔습니다. 벽 따라기를 종료합니다.')
+                        self.cancel_wall_follow()
+                    elif self.total_distance >= self.max_wall_follow_distance:
+                        self.get_logger().info('최대 이동 거리를 초과하였습니다. 벽 따라기를 종료합니다.')
+                        self.cancel_wall_follow()
 
         # 이전 위치 업데이트
         self.previous_position = self.current_position
@@ -382,8 +383,8 @@ class CleaningNode(Node):
         """
         "wall_follow" 액션 서버로부터 피드백을 처리하는 콜백 함수입니다.
         """
-        feedback = feedback_msg.feedback
-        self.get_logger().debug(f'벽 따라가기 진행 중: 현재 거리 = {feedback.current_distance:.2f}m')
+        # 피드백 메시지 처리
+        self.get_logger().debug('벽 따라가기 진행 중...')
 
     def start_coverage_cleaning(self):
         """
@@ -627,7 +628,6 @@ class CleaningNode(Node):
         "dock" 액션 서버로부터 피드백을 처리하는 콜백 함수입니다.
         """
         # 필요에 따라 피드백 처리
-        feedback = feedback_msg.feedback
         self.get_logger().debug('도킹 진행 중...')
 
     def publish_cleaning_markers(self, waypoints):
