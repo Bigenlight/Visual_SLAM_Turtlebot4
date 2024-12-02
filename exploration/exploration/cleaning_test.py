@@ -32,10 +32,10 @@ class CleaningNode(Node):
             Odometry, '/odom', self.odom_callback, qos_odom)
         self.get_logger().info('Subscribed to /odom topic.')
 
-        # /amcl_pose 토픽 구독 (AMCL 초기화 확인용)
+        # /amcl_pose 토픽 구독 (AMCL 위치 추정용)
         self.amcl_pose_subscriber = self.create_subscription(
             PoseWithCovarianceStamped, '/amcl_pose', self.amcl_pose_callback, 10)
-        self.amcl_pose_received = Event()
+        self.amcl_pose_received = False
 
         # "navigate_to_pose" 액션 클라이언트 초기화
         self.navigate_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -52,17 +52,15 @@ class CleaningNode(Node):
         # 변수 초기화
         self.cleaning_started = False  # 청소 시작 플래그 초기화
 
-        # /initialpose 퍼블리셔 초기화
-        self.initial_pose_publisher = self.create_publisher(
-            PoseWithCovarianceStamped, '/initialpose', 10)
-        self.get_logger().info('Initialized /initialpose publisher.')
-
         self.state = 'idle'  # 현재 상태: idle, coverage_cleaning, wall_following, docking
         self.coverage_waypoints = []  # 커버리지 경로 웨이포인트 리스트
         self.current_waypoint_index = 0  # 현재 진행 중인 웨이포인트 인덱스
 
         # 위치 추적을 위한 변수
         self.current_position = None
+
+        # 로봇의 초기 위치
+        self.robot_initial_pose = None
 
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
         qos_marker = QoSProfile(
@@ -87,30 +85,41 @@ class CleaningNode(Node):
         # 청소된 영역 추적을 위한 맵 초기화
         self.cleaned_map = np.zeros((self.map_info.height, self.map_info.width), dtype=np.uint8)
 
-        # 초기 위치가 설정되었는지 확인하는 플래그
-        self.initial_pose_published = False
-
-        # 초기 위치 퍼블리시를 위한 타이머 설정 (한 번만 실행)
-        self.initial_pose_timer = self.create_timer(1.0, self.publish_initial_pose)
-        self.get_logger().info('Timer to publish initial pose has been set.')
+        # AMCL 초기화 대기를 위한 타이머 설정
+        self.amcl_wait_timer = self.create_timer(1.0, self.check_amcl_initialization)
+        self.get_logger().info('Timer to check AMCL initialization has been set.')
 
     def amcl_pose_callback(self, msg):
         """
         AMCL의 위치 추정을 받았을 때 호출되는 콜백 함수입니다.
         """
-        if not self.amcl_pose_received.is_set():
-            self.amcl_pose_received.set()
-            self.get_logger().info('AMCL이 초기화되었습니다.')
-            # 청소 작업 시작 (이미 start_cleaning 호출됨)
-            # 필요 시 추가 로직을 여기에 작성할 수 있습니다.
+        if not self.amcl_pose_received:
+            self.amcl_pose_received = True
+            self.robot_initial_pose = msg.pose.pose
+            self.get_logger().info('AMCL에서 로봇의 초기 위치를 받았습니다.')
+            self.get_logger().info(f'로봇 초기 위치: x={self.robot_initial_pose.position.x:.2f}, y={self.robot_initial_pose.position.y:.2f}')
+            # AMCL 초기화 대기 타이머 취소
+            self.amcl_wait_timer.cancel()
+            # 청소 작업 시작
+            self.start_cleaning()
+
+    def check_amcl_initialization(self):
+        """
+        AMCL이 초기화되었는지 확인합니다.
+        """
+        if not self.amcl_pose_received:
+            self.get_logger().info('AMCL에서 위치 추정을 기다리는 중입니다...')
+        else:
+            # 이미 AMCL 위치를 받았으므로 타이머를 취소합니다.
+            self.amcl_wait_timer.cancel()
 
     def load_map(self):
         """
         맵 파일을 로드하여 맵 데이터를 설정합니다.
         """
         # 맵 파일 경로 설정 (파라미터로 받아오기)
-        self.declare_parameter('map_test', '/home/theo/4_ws/map_test.yaml')  # 실제 맵 경로로 수정하세요
-        map_file_path = self.get_parameter('map_test').get_parameter_value().string_value
+        self.declare_parameter('map_file_path', '/path/to/your/map.yaml')  # 실제 맵 경로로 수정하세요
+        map_file_path = self.get_parameter('map_file_path').get_parameter_value().string_value
 
         if not os.path.exists(map_file_path):
             self.get_logger().error(f'맵 파일을 찾을 수 없습니다: {map_file_path}')
@@ -198,61 +207,9 @@ class CleaningNode(Node):
             self.map_info = None
             return
 
-    def set_initial_pose(self):
-        """
-        코드 내에서 직접 초기 위치를 설정합니다.
-        """
-        initial_pose = Pose()
-        initial_pose.position.x = 0.0  # 실제 초기 위치로 수정하세요
-        initial_pose.position.y = 0.0  # 실제 초기 위치로 수정하세요
-        initial_pose.position.z = 0.0
-        # 초기 방향 설정 (여기서는 0도로 설정)
-        quat = transforms3d.euler.euler2quat(0, 0, 0, axes='sxyz')
-        initial_pose.orientation.x = quat[1]
-        initial_pose.orientation.y = quat[2]
-        initial_pose.orientation.z = quat[3]
-        initial_pose.orientation.w = quat[0]
-        self.get_logger().info(f'초기 위치 설정: (x={initial_pose.position.x:.2f}, y={initial_pose.position.y:.2f})')
-        return initial_pose
-
-    def publish_initial_pose(self):
-        """
-        AMCL에게 초기 위치를 알려주기 위해 /initialpose 토픽에 퍼블리시합니다.
-        """
-        if self.initial_pose_published:
-            return
-
-        # 초기 위치 퍼블리시
-        initial_pose_msg = PoseWithCovarianceStamped()
-        initial_pose_msg.header.stamp = self.get_clock().now().to_msg()
-        initial_pose_msg.header.frame_id = 'map'
-        initial_pose_msg.pose.pose = self.set_initial_pose()
-
-        # Covariance 설정
-        initial_pose_msg.pose.covariance = [
-            0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.25, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0685, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0685, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0685
-        ]
-
-        self.initial_pose_publisher.publish(initial_pose_msg)
-        self.get_logger().info('AMCL에 초기 위치를 퍼블리시하였습니다.')
-
-        # 초기 위치가 퍼블리시되었음을 표시
-        self.initial_pose_published = True
-
-        # 초기 위치 퍼블리시 타이머 종료
-        self.initial_pose_timer.cancel()
-
-        # 이제 AMCL이 초기화될 때까지 기다립니다.
-        # AMCL이 초기화되면 amcl_pose_callback에서 청소 작업이 시작됩니다.
-
     def start_cleaning(self):
         """
-        초기 위치 퍼블리시 후 청소 작업을 시작합니다.
+        AMCL로부터 위치를 받은 후 청소 작업을 시작합니다.
         """
         self.get_logger().info('청소 작업을 시작합니다.')
         self.state = 'coverage_cleaning'
@@ -331,6 +288,14 @@ class CleaningNode(Node):
         # 자유 공간 좌표 추출
         free_space = np.where(map_array == 0, 1, 0)
 
+        # 로봇의 초기 위치를 기준으로 가까운 곳부터 탐색하도록 웨이포인트를 생성
+        if self.robot_initial_pose is None:
+            self.get_logger().error('로봇의 초기 위치가 설정되지 않았습니다.')
+            return
+
+        robot_x = self.robot_initial_pose.position.x
+        robot_y = self.robot_initial_pose.position.y
+
         # 그리드 기반 경로 생성
         num_cells_x = int((width * resolution) / grid_size)
         num_cells_y = int((height * resolution) / grid_size)
@@ -338,15 +303,10 @@ class CleaningNode(Node):
         x_coords = np.linspace(origin_x, origin_x + (width - 1) * resolution, num_cells_x)
         y_coords = np.linspace(origin_y, origin_y + (height - 1) * resolution, num_cells_y)
 
-        direction = 1  # 방향 제어 변수
-
-        for idx_y, y in enumerate(y_coords):
-            if direction == 1:
-                x_iter = x_coords
-            else:
-                x_iter = x_coords[::-1]
-
-            for x in x_iter:
+        # 로봇의 위치에 가장 가까운 그리드부터 시작하도록 정렬
+        waypoints = []
+        for y in y_coords:
+            for x in x_coords:
                 # 해당 좌표가 자유 공간인지 확인
                 map_x = int((x - origin_x) / resolution)
                 map_y = int((y - origin_y) / resolution)
@@ -361,9 +321,15 @@ class CleaningNode(Node):
                         pose.pose.position.y = y
                         pose.pose.position.z = 0.0
                         pose.pose.orientation = self.yaw_to_quaternion(0.0)
-                        self.coverage_waypoints.append(pose)
+                        waypoints.append(pose)
 
-            direction *= -1  # 방향 반전
+        # 로봇의 위치에 따라 웨이포인트를 정렬
+        waypoints.sort(key=lambda wp: math.hypot(wp.pose.position.x - robot_x, wp.pose.position.y - robot_y))
+
+        # 지그재그 패턴 적용 (선택 사항)
+        # 필요에 따라 웨이포인트의 순서를 조정할 수 있습니다.
+
+        self.coverage_waypoints = waypoints
 
     def yaw_to_quaternion(self, yaw):
         """
