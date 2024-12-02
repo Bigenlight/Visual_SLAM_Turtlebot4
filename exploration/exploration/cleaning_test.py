@@ -97,7 +97,7 @@ class CleaningNode(Node):
         self.get_logger().info('Initialized /map publisher.')
 
         # 맵 파일 경로 설정
-        self.map_file_path = '/home/rokey/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
+        self.map_file_path = '/home/theo/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
         self.get_logger().info(f'Loading map from {self.map_file_path}')
 
         # 맵 데이터 로드
