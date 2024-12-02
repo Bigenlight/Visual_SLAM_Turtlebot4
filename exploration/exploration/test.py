@@ -77,6 +77,12 @@ class FrontierExplorer(Node):
         # 청소 알고리즘으로 신호를 보내기 위한 퍼블리셔 초기화
         self.cleaning_publisher = self.create_publisher(Bool, '/cleaning', 10)
 
+        # Shutdown flag to prevent multiple shutdowns
+        self.shutting_down = False
+
+        # Exploration check timer (calls is_map_explored every 2 seconds)
+        self.exploration_check_timer = self.create_timer(2.0, self.exploration_check_callback)
+
     def map_callback(self, msg):
         """
         /map 토픽의 콜백 함수.
@@ -85,15 +91,28 @@ class FrontierExplorer(Node):
         self.map_data = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
         self.map_info = msg.info
 
-        if not self.exploring:
+        if not self.exploring and not self.shutting_down:
             self.find_and_navigate_to_frontier()
+
+    def exploration_check_callback(self):
+        """
+        주기적으로 맵이 완전히 탐사되었는지 확인합니다.
+        만약 완전히 탐사되었다면, 맵을 저장하고 시스템을 종료합니다.
+        """
+        if self.shutting_down:
+            return  # 이미 종료 중이면 아무것도 하지 않음
+
+        if self.is_map_explored():
+            self.get_logger().info('주기적 확인 중 맵이 완전히 탐사되었습니다. 시스템을 종료합니다.')
+            self.stop_robot()
+            self.shutdown()
 
     def find_and_navigate_to_frontier(self):
         """
         프론티어를 탐지하고, 클러스터링하며, 유효한 프론티어를 선택하여 네비게이션 목표를 보냅니다.
         """
-        if self.exploring:
-            self.get_logger().debug('Already exploring. Skipping find_and_navigate_to_frontier.')
+        if self.exploring or self.shutting_down:
+            self.get_logger().debug('Already exploring or shutting down. Skipping find_and_navigate_to_frontier.')
             return
 
         self.exploring = True  # Indicate that we are now exploring
@@ -187,8 +206,8 @@ class FrontierExplorer(Node):
 
     def detect_frontiers(self):
         """
-        맵에서 프론티어 포인트를 탐지합니다.
-        프론티어는 적어도 두 개의 미지 셀과 인접한 자유 셀입니다.
+        Detects frontier points in the map.
+        A frontier is a free cell that is adjacent to at least one unknown cell and not adjacent to any obstacle cells.
         """
         if self.map_data is None:
             self.get_logger().warn('Map data is not available.')
@@ -197,22 +216,31 @@ class FrontierExplorer(Node):
         height, width = self.map_data.shape
         frontier_points = []
 
-        # 모든 자유 셀을 탐색
+        # Find all free cells in the map
         free_cells = np.argwhere(self.map_data == 0)
 
         for cell in free_cells:
             y, x = cell
             neighbors = self.get_neighbors(x, y)
-            unknown_neighbors = 0
+            has_unknown_neighbor = False
+            has_obstacle_neighbor = False
+
             for nx, ny in neighbors:
-                if self.map_data[ny, nx] == -1:
-                    unknown_neighbors += 1
-            if unknown_neighbors >= 1:  # 최소 한 개의 미지 셀과 인접해야 함
+                neighbor_value = self.map_data[ny, nx]
+                if neighbor_value == -1:
+                    has_unknown_neighbor = True
+                elif neighbor_value >= 50:
+                    has_obstacle_neighbor = True
+                    break  # No need to check further if obstacle is found
+
+            # Only consider the cell as a frontier if it has unknown neighbors and no obstacle neighbors
+            if has_unknown_neighbor and not has_obstacle_neighbor:
                 mx, my = self.grid_to_map(x, y)
                 frontier_points.append([mx, my])
 
         self.get_logger().info(f'Detected {len(frontier_points)} frontier points.')
         return frontier_points
+
 
     def cluster_frontiers(self, frontiers):
         """
@@ -338,7 +366,7 @@ class FrontierExplorer(Node):
 
     def get_neighbors(self, x, y):
         """
-        주어진 셀의 8-연결 이웃을 반환합니다.
+        Returns the 8-connected neighbors of a given cell.
         """
         neighbors = []
         width = self.map_data.shape[1]
@@ -350,6 +378,7 @@ class FrontierExplorer(Node):
                 if (dx != 0 or dy != 0) and 0 <= nx < width and 0 <= ny < height:
                     neighbors.append((nx, ny))
         return neighbors
+
 
     def grid_to_map(self, x, y):
         """
@@ -417,55 +446,34 @@ class FrontierExplorer(Node):
         self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
 
         # 임계값 설정 (예: 접근 가능한 미지 영역이 수치 미만일 때 탐색 완료로 판단)
-        if accessible_unknown_ratio < 0.0005:
+        if accessible_unknown_ratio < 0.002:
             return True
         else:
             return False
 
     def count_accessible_unknown_cells(self):
         """
-        접근 가능한 미지 영역의 수를 계산합니다.
-        접근 가능성은 로봇의 현재 위치에서 BFS를 통해 확인합니다.
+        Counts the number of accessible unknown cells in the map.
+        Accessible unknown cells are unknown cells that are adjacent to free space.
         """
-        if self.map_data is None or self.map_info is None:
+        if self.map_data is None:
             return 0
-
-        # 로봇의 현재 위치를 그리드 좌표로 변환
-        robot_pose = self.get_robot_pose()
-        if robot_pose is None:
-            self.get_logger().warn('로봇의 위치를 가져올 수 없어 접근 가능한 미지 영역을 계산할 수 없습니다.')
-            return 0
-
-        robot_grid_x = int((robot_pose.x - self.map_info.origin.position.x) / self.map_info.resolution)
-        robot_grid_y = int((robot_pose.y - self.map_info.origin.position.y) / self.map_info.resolution)
 
         height, width = self.map_data.shape
-        if not (0 <= robot_grid_x < width and 0 <= robot_grid_y < height):
-            self.get_logger().warn('로봇의 그리드 위치가 맵 범위를 벗어났습니다.')
-            return 0
-
-        visited = np.zeros((height, width), dtype=bool)
-        queue = deque()
-        queue.append((robot_grid_x, robot_grid_y))
-        visited[robot_grid_y, robot_grid_x] = True
-
         accessible_unknown = 0
 
-        while queue:
-            x, y = queue.popleft()
-
-            neighbors = self.get_neighbors(x, y)
-            for nx, ny in neighbors:
-                if not visited[ny, nx]:
-                    if self.map_data[ny, nx] == 0:  # 자유 공간
-                        visited[ny, nx] = True
-                        queue.append((nx, ny))
-                    elif self.map_data[ny, nx] == -1:  # 미지 공간
-                        accessible_unknown += 1
-                        visited[ny, nx] = True  # 방문 표시하여 중복 계산 방지
+        for y in range(height):
+            for x in range(width):
+                if self.map_data[y, x] == -1:  # Unknown cell
+                    neighbors = self.get_neighbors(x, y)
+                    for nx, ny in neighbors:
+                        if self.map_data[ny, nx] == 0:  # Free cell
+                            accessible_unknown += 1
+                            break  # No need to check other neighbors
 
         self.get_logger().info(f'접근 가능한 미지 영역 수: {accessible_unknown}')
         return accessible_unknown
+
 
     def goal_response_callback(self, future):
         """
@@ -548,11 +556,27 @@ class FrontierExplorer(Node):
         """
         pass
 
+
+    # Update the shutdown method
     def shutdown(self):
         """
         탐사를 중단하고 노드를 정상적으로 종료합니다.
         """
+        if self.shutting_down:
+            return  # 이미 종료 중이면 아무것도 하지 않음
+
+        self.shutting_down = True
         self.get_logger().info('탐사 노드를 종료합니다.')
+
+        # Cancel any current goals
+        if self.current_goal is not None:
+            self.get_logger().info('현재 목표를 취소합니다.')
+            cancel_future = self.current_goal.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future)
+            self.current_goal = None
+
+        # Stop the robot
+        self.stop_robot()
 
         try:
             # 맵 저장 서비스 호출
@@ -569,44 +593,9 @@ class FrontierExplorer(Node):
         # 모든 타이머 취소
         self.cancel_all_timers()
 
-        # 로봇 정지
-        self.stop_robot()
-
         # 노드 파괴 및 종료
         self.destroy_node()
         rclpy.shutdown()
-
-    def save_map(self):
-        """
-        현재 맵을 저장하기 위해 /slam_toolbox/save_map 서비스를 호출합니다.
-        """
-        self.get_logger().info('맵 저장 서비스를 호출합니다.')
-
-        # 서비스가 준비될 때까지 대기
-        if not self.save_map_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error('/slam_toolbox/save_map 서비스가 준비되지 않았습니다.')
-            return
-
-        # 서비스 요청 생성
-        request = SaveMap.Request()
-
-        # Properly set the 'name' field as a std_msgs/String message
-        request.name = String()
-        request.name.data = 'map_test'
-
-        # Call the service asynchronously
-        future = self.save_map_client.call_async(request)
-
-        # Wait for the service response
-        rclpy.spin_until_future_complete(self, future)
-
-        if future.result() is not None:
-            if future.result().success:
-                self.get_logger().info('맵이 성공적으로 저장되었습니다.')
-            else:
-                self.get_logger().error(f"맵 저장에 실패하였습니다: {future.result().message}")
-        else:
-            self.get_logger().error('맵 저장 서비스 호출에 실패하였습니다.')
 
     def cancel_all_timers(self):
         """
@@ -616,8 +605,10 @@ class FrontierExplorer(Node):
             self.movement_timer.cancel()
             self.get_logger().debug('이동 모니터링 타이머를 취소하였습니다.')
 
-        # 다른 타이머가 있다면 추가로 취소
-        # 예: self.another_timer.cancel()
+        if hasattr(self, 'exploration_check_timer') and self.exploration_check_timer is not None:
+            self.exploration_check_timer.cancel()
+            self.get_logger().debug('탐사 확인 타이머를 취소하였습니다.')
+
 
     def stop_robot(self):
         """
