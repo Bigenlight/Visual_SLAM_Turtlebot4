@@ -17,8 +17,8 @@ import os
 from PIL import Image
 from irobot_create_msgs.action import WallFollow, Dock
 import transforms3d
-from action_msgs.msg import GoalStatus  # 추가
-import time  # 추가
+from action_msgs.msg import GoalStatus
+import time
 
 
 class CleaningNode(Node):
@@ -49,7 +49,7 @@ class CleaningNode(Node):
         # 변수 초기화
         self.map_data = None
         self.map_info = None
-        self.cleaning_started = False
+        self.cleaning_started = False  # 수정: 청소 시작 플래그 초기화
 
         # /initialpose 퍼블리셔 초기화
         self.initial_pose_publisher = self.create_publisher(
@@ -57,7 +57,8 @@ class CleaningNode(Node):
         self.get_logger().info('Initialized /initialpose publisher.')
 
         # 타이머를 사용하여 초기 위치 퍼블리시 (블로킹 방지)
-        self.create_timer(2.0, self.publish_initial_pose)  # 2초 후 초기 위치 퍼블리시
+        self.create_timer(2.0, self.publish_initial_pose)
+        self.get_logger().info('Timer to publish initial pose has been set.')
 
         self.state = 'idle'  # 현재 상태: idle, wall_following, coverage_cleaning, docking
         self.coverage_waypoints = []  # 커버리지 경로 웨이포인트 리스트
@@ -97,7 +98,7 @@ class CleaningNode(Node):
         self.get_logger().info('Initialized /map publisher.')
 
         # 맵 파일 경로 설정
-        self.map_file_path = '/home/theo/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
+        self.map_file_path = '/home/rokey/4_ws/map_test.yaml'  # 실제 맵 파일 경로로 수정하세요
         self.get_logger().info(f'Loading map from {self.map_file_path}')
 
         # 맵 데이터 로드
@@ -107,7 +108,7 @@ class CleaningNode(Node):
         self.publish_map()
 
         # wall_follow 시작 시간을 저장할 변수 초기화
-        self.wall_follow_start_time = None  # 추가
+        self.wall_follow_start_time = None
 
     def set_initial_pose(self):
         """
@@ -130,12 +131,15 @@ class CleaningNode(Node):
         """
         AMCL에게 초기 위치를 알려주기 위해 /initialpose 토픽에 퍼블리시합니다.
         """
+        if self.cleaning_started:
+            return
+
         initial_pose_msg = PoseWithCovarianceStamped()
         initial_pose_msg.header.stamp = self.get_clock().now().to_msg()
         initial_pose_msg.header.frame_id = 'map'
         initial_pose_msg.pose.pose = self.set_initial_pose().pose
 
-        # Covariance 설정 (모든 0을 0.0으로 변경)
+        # Covariance 설정
         initial_pose_msg.pose.covariance = [
             0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
             0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
@@ -150,6 +154,7 @@ class CleaningNode(Node):
 
         # 초기 위치 퍼블리시 후 청소 시작
         self.start_cleaning()
+        self.cleaning_started = True  # 수정: 청소 시작 플래그 설정
 
     def load_map(self, map_file_path):
         """
@@ -295,14 +300,6 @@ class CleaningNode(Node):
                         self.get_logger().info('최대 이동 거리를 초과하였습니다. 벽 따라기를 종료합니다.')
                         self.cancel_wall_follow()
 
-                # 30초 경과 여부 확인
-                if self.wall_follow_start_time is not None:
-                    elapsed_time = self.get_clock().now() - self.wall_follow_start_time
-                    elapsed_seconds = elapsed_time.nanoseconds / 1e9
-                    if elapsed_seconds >= 30.0:
-                        self.get_logger().info('30초가 경과하였습니다. 벽 따라기를 종료합니다.')
-                        self.cancel_wall_follow()
-
         # 이전 위치 업데이트
         self.previous_position = self.current_position
 
@@ -335,12 +332,11 @@ class CleaningNode(Node):
 
         # "wall_follow" 액션 목표 생성
         goal_msg = WallFollow.Goal()
-        goal_msg.follow_side = WallFollow.Goal.FOLLOW_LEFT  # 왼쪽 벽 따라가기
-        # 최대 실행 시간을 충분히 크게 설정 (벽 따라기 종료는 Odom 콜백에서 처리)
-        goal_msg.max_runtime = rclpy.duration.Duration(seconds=3600).to_msg()
+        goal_msg.follow_side = 1  # FOLLOW_LEFT
+        goal_msg.max_runtime = rclpy.duration.Duration(seconds=30).to_msg()  # 수정: max_runtime을 30초로 설정
 
         # 액션 요청 보내기
-        self.get_logger().info('"wall_follow" 액션을 시작합니다.')
+        self.get_logger().info(f'"wall_follow" 액션을 시작합니다. Goal: follow_side={goal_msg.follow_side}, max_runtime={goal_msg.max_runtime}')
         send_goal_future = self.wall_follow_client.send_goal_async(
             goal_msg,
             feedback_callback=self.wall_follow_feedback_callback
@@ -372,17 +368,18 @@ class CleaningNode(Node):
         """
         "wall_follow" 액션 서버로부터 목표 수락 응답을 처리하는 콜백 함수입니다.
         """
-        self.wall_follow_goal_handle = future.result()
-        if not self.wall_follow_goal_handle.accepted:
+        goal_handle = future.result()
+        if not goal_handle.accepted:
             self.get_logger().error('"wall_follow" 액션 목표가 거부되었습니다.')
             self.cleaning_started = False
             self.state = 'idle'
             return
 
         self.get_logger().info('"wall_follow" 액션 목표가 수락되었습니다.')
+        self.wall_follow_goal_handle = goal_handle
 
         # 목표 결과를 비동기로 가져옴
-        get_result_future = self.wall_follow_goal_handle.get_result_async()
+        get_result_future = goal_handle.get_result_async()
         get_result_future.add_done_callback(self.wall_follow_get_result_callback)
 
     def wall_follow_get_result_callback(self, future):
