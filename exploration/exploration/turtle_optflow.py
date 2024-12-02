@@ -30,6 +30,11 @@ class RobotCamORB(Node):
         self.get_logger().info(f"Minimum number of features set to: {self.min_features}")
         self.get_logger().info(f"Maximum number of features set to: {self.max_features}")
 
+        # 최소 이동 거리 기준 파라미터 추가
+        self.declare_parameter('min_movement', 10.0)  # 기본값: 10.0 픽셀
+        self.min_movement = self.get_parameter('min_movement').value
+        self.get_logger().info(f"Minimum movement set to: {self.min_movement} pixels")
+
         # Lucas-Kanade Optical Flow 초기화
         self.prev_gray = None
         self.lk_params = dict(
@@ -38,8 +43,8 @@ class RobotCamORB(Node):
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03)
         )
 
-        # 랜덤 색상 생성
-        self.colors = np.random.randint(0, 255, (1000, 3))
+        # 랜덤 색상 생성 (초록색 과도 포함 방지)
+        self.colors = self.generate_colors(1000)
 
         # 마스크 이미지 생성
         self.mask = None
@@ -73,6 +78,21 @@ class RobotCamORB(Node):
         cv2.namedWindow("Robot Camera - ORB Optical Flow", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Robot Camera - ORB Optical Flow", 640, 640)  # 초기 창 크기 설정
 
+    def generate_colors(self, n):
+        """
+        초록색과 유사한 색상을 배제한 랜덤 색상 생성 함수.
+        G 채널을 제한하여 초록색을 피합니다.
+        """
+        colors = []
+        while len(colors) < n:
+            b = np.random.randint(0, 256)
+            g = np.random.randint(0, 50)  # G 채널을 낮게 설정하여 초록색 피함
+            r = np.random.randint(0, 256)
+            # G 채널이 너무 높지 않은지 확인
+            if g < 50:
+                colors.append((b, g, r))
+        return colors
+
     def image_callback(self, msg):
         """
         카메라 이미지 콜백 함수.
@@ -93,7 +113,7 @@ class RobotCamORB(Node):
 
             # 샤프닝 필터 적용
             kernel = np.array([[0, -1, 0],
-                               [-1, 5,-1],
+                               [-1, 5, -1],
                                [0, -1, 0]])
             gray = cv2.filter2D(gray, -1, kernel)
 
@@ -118,19 +138,21 @@ class RobotCamORB(Node):
 
                 self.features = [{
                     'path': [np.array(pt, dtype=np.float32)],
-                    'color': tuple(self.colors[i % len(self.colors)].tolist()),
+                    'color': self.colors[i % len(self.colors)],
                     'lost': 0
                 } for i, pt in enumerate(points)]
 
                 self.mask = np.zeros_like(frame)
                 self.get_logger().info(f"Initial keypoints detected: {len(points)}")
 
-                # 초기 키포인트 시각화
-                frame_with_keypoints = cv2.drawKeypoints(
-                    frame, keypoints, None, color=(0, 255, 0),
-                    flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
-                )
-                img_large = cv2.resize(frame_with_keypoints, None, fx=1.0, fy=1.0, interpolation=cv2.INTER_LINEAR)  # No upscaling here
+                # 초기 시각화 제거 (초록색 점 그리기 제거)
+                # 초기 프레임에서는 시각화를 건너뜁니다.
+                img = cv2.add(frame, self.mask)
+
+                # 이미지 두 배로 업스케일링
+                img_large = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+
+                # 팝업 창에 Optical Flow 결과 표시
                 cv2.imshow("Robot Camera - ORB Optical Flow", img_large)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.get_logger().info("Exiting camera display...")
@@ -163,11 +185,17 @@ class RobotCamORB(Node):
                         if len(feature['path']) > self.max_path_length:
                             feature['path'].pop(0)
 
+                        # 이동 거리 계산
+                        movement = np.linalg.norm(feature['path'][-1] - feature['path'][0])
+                        if movement < self.min_movement:
+                            continue  # 이동이 충분하지 않은 특징점은 시각화하지 않음
+
                         for j in range(1, len(feature['path'])):
                             pt1 = tuple(map(int, feature['path'][j - 1]))
                             pt2 = tuple(map(int, feature['path'][j]))
                             cv2.line(self.mask, pt1, pt2, color, 2)
 
+                        # 현재 위치에 원 그리기
                         cv2.circle(frame, tuple(map(int, new_pt)), 5, color, -1)
                         new_features.append(feature)
                     else:
@@ -203,7 +231,7 @@ class RobotCamORB(Node):
 
                 # 새로운 특징점 추가
                 for pt in new_features_to_add:
-                    color = tuple(self.colors[len(self.features) % len(self.colors)].tolist())
+                    color = self.colors[len(self.features) % len(self.colors)]
                     self.features.append({
                         'path': [np.array(pt, dtype=np.float32)],
                         'color': color,
@@ -224,12 +252,16 @@ class RobotCamORB(Node):
             # 업데이트된 특징점으로 마스크 및 시각화
             for feature in self.features:
                 if len(feature['path']) > 1:
+                    # 이동 거리 계산
+                    movement = np.linalg.norm(feature['path'][-1] - feature['path'][0])
+                    if movement < self.min_movement:
+                        continue  # 이동이 충분하지 않은 특징점은 시각화하지 않음
                     for j in range(1, len(feature['path'])):
                         pt1 = tuple(map(int, feature['path'][j - 1]))
                         pt2 = tuple(map(int, feature['path'][j]))
                         cv2.line(self.mask, pt1, pt2, feature['color'], 2)
-                # 현재 위치에 원 그리기
-                cv2.circle(frame, tuple(map(int, feature['path'][-1])), 5, feature['color'], -1)
+                    # 현재 위치에 원 그리기
+                    cv2.circle(frame, tuple(map(int, feature['path'][-1])), 5, feature['color'], -1)
 
             self.get_logger().info(f"Active features after enforcing limits: {len(self.features)}")
 
@@ -239,12 +271,6 @@ class RobotCamORB(Node):
 
             # 이미지 두 배로 업스케일링
             img_large = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-
-            # 현재 활성화된 특징점 시각화
-            if self.features:
-                current_points = [tuple(map(int, feature['path'][-1])) for feature in self.features]
-                for pt in current_points:
-                    cv2.circle(img_large, pt, 3, (0, 255, 0), -1)
 
             # 팝업 창에 Optical Flow 결과 표시
             cv2.imshow("Robot Camera - ORB Optical Flow", img_large)
