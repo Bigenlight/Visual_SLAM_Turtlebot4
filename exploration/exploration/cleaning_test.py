@@ -4,12 +4,10 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
-from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped, Point
+from geometry_msgs.msg import PoseStamped, Quaternion, Point, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener
-from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
-from action_msgs.msg import GoalStatus
 from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from rclpy.qos import QoSPresetProfiles
@@ -20,6 +18,7 @@ import os
 from PIL import Image
 from irobot_create_msgs.action import WallFollow, Dock
 import transforms3d
+import time  # 추가
 
 
 class CleaningNode(Node):
@@ -56,7 +55,18 @@ class CleaningNode(Node):
         self.map_data = None
         self.map_info = None
         self.cleaning_started = False
-        self.initial_pose = self.set_initial_pose()  # 초기 위치 설정
+
+        # /initialpose 퍼블리셔 초기화
+        self.initial_pose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped, '/initialpose', 10)
+
+        # AMCL이 시작될 시간을 확보하기 위해 잠시 대기
+        self.get_logger().info('AMCL이 시작될 때까지 잠시 대기합니다...')
+        time.sleep(2)  # 필요에 따라 조정
+
+        # 초기 위치 설정 및 퍼블리시
+        self.initial_pose = self.set_initial_pose()
+        self.publish_initial_pose()
 
         self.state = 'idle'  # 현재 상태: idle, wall_following, coverage_cleaning, docking
         self.coverage_waypoints = []  # 커버리지 경로 웨이포인트 리스트
@@ -75,9 +85,6 @@ class CleaningNode(Node):
         # TF2 Buffer 및 Listener 초기화
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # Static Transform Broadcaster 초기화
-        self.static_broadcaster = StaticTransformBroadcaster(self)
 
         # RViz 시각화를 위한 마커 퍼블리셔 초기화
         qos_marker = QoSProfile(
@@ -121,49 +128,27 @@ class CleaningNode(Node):
         self.get_logger().info(f'초기 위치 설정: (x={initial_pose.pose.position.x:.2f}, y={initial_pose.pose.position.y:.2f})')
         return initial_pose
 
-    def compute_map_to_odom_transform(self):
+    def publish_initial_pose(self):
         """
-        initial_pose를 기반으로 map->odom 변환을 계산합니다.
+        AMCL에게 초기 위치를 알려주기 위해 /initialpose 토픽에 퍼블리시합니다.
         """
-        # initial_pose에서 위치와 방향 추출
-        p = self.initial_pose.pose.position
-        q = self.initial_pose.pose.orientation
+        initial_pose_msg = PoseWithCovarianceStamped()
+        initial_pose_msg.header.stamp = self.get_clock().now().to_msg()
+        initial_pose_msg.header.frame_id = 'map'
+        initial_pose_msg.pose.pose = self.initial_pose.pose
 
-        # 쿼터니언을 회전 행렬로 변환 (transforms3d는 [w, x, y, z] 순서 사용)
-        quat = [q.w, q.x, q.y, q.z]
-        rot_matrix = transforms3d.quaternions.quat2mat(quat)
+        # Covariance 설정 (필요에 따라 조정 가능)
+        initial_pose_msg.pose.covariance = [
+            0.25, 0, 0, 0, 0, 0,
+            0, 0.25, 0, 0, 0, 0,
+            0, 0, 0.25, 0, 0, 0,
+            0, 0, 0, 0.06853891945200942, 0, 0,
+            0, 0, 0, 0, 0.06853891945200942, 0,
+            0, 0, 0, 0, 0, 0.06853891945200942
+        ]
 
-        # 회전 행렬의 전치로 역회전 계산
-        inv_rot_matrix = rot_matrix.T
-
-        # 위치 벡터 생성
-        position_vector = np.array([p.x, p.y, p.z])
-
-        # 역변환된 위치 계산
-        inv_translation = -np.dot(inv_rot_matrix, position_vector)
-
-        # 쿼터니언의 켤레로 역회전 계산
-        inv_quat = [q.w, -q.x, -q.y, -q.z]
-
-        # 역변환된 쿼터니언을 Quaternion 메시지로 변환
-        inv_q = Quaternion(
-            x=inv_quat[1],
-            y=inv_quat[2],
-            z=inv_quat[3],
-            w=inv_quat[0]
-        )
-
-        # TransformStamped 메시지 생성
-        transform = TransformStamped()
-        transform.header.stamp = self.get_clock().now().to_msg()
-        transform.header.frame_id = 'map'
-        transform.child_frame_id = 'odom'
-        transform.transform.translation.x = inv_translation[0]
-        transform.transform.translation.y = inv_translation[1]
-        transform.transform.translation.z = inv_translation[2]
-        transform.transform.rotation = inv_q
-
-        return transform
+        self.initial_pose_publisher.publish(initial_pose_msg)
+        self.get_logger().info('AMCL에 초기 위치를 퍼블리시하였습니다.')
 
     def load_map(self, map_file_path):
         """
@@ -243,11 +228,6 @@ class CleaningNode(Node):
 
             self.get_logger().info(f'맵을 성공적으로 로드하였습니다: {width}x{height}, 해상도={resolution}m/pix')
             self.get_logger().info(f'Origin: x={map_info.origin.position.x}, y={map_info.origin.position.y}, z={map_info.origin.position.z}')
-
-            # initial_pose를 기반으로 map->odom 변환 설정
-            transform = self.compute_map_to_odom_transform()
-            self.static_broadcaster.sendTransform(transform)
-            self.get_logger().info('initial_pose를 기반으로 map->odom 변환을 설정하였습니다.')
 
         except Exception as e:
             self.get_logger().error(f'맵 이미지를 처리하는 중 오류 발생: {e}')
@@ -559,7 +539,8 @@ class CleaningNode(Node):
         """
         "navigate_to_pose" 액션 서버로부터 결과를 처리하는 콜백 함수입니다.
         """
-        status = future.result().status
+        result = future.result()
+        status = result.status
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('웨이포인트에 도착하였습니다.')
@@ -635,7 +616,8 @@ class CleaningNode(Node):
         """
         "dock" 액션 서버로부터 결과를 처리하는 콜백 함수입니다.
         """
-        status = future.result().status
+        result = future.result()
+        status = result.status
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('"dock" 액션이 성공적으로 완료되었습니다.')
