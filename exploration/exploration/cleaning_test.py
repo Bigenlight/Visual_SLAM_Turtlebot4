@@ -90,7 +90,7 @@ class CleaningNode(Node):
         # 초기 위치가 설정되었는지 확인하는 플래그
         self.initial_pose_published = False
 
-        # 초기 위치 퍼블리시를 위한 타이머 설정
+        # 초기 위치 퍼블리시를 위한 타이머 설정 (한 번만 실행)
         self.initial_pose_timer = self.create_timer(1.0, self.publish_initial_pose)
         self.get_logger().info('Timer to publish initial pose has been set.')
 
@@ -101,14 +101,16 @@ class CleaningNode(Node):
         if not self.amcl_pose_received.is_set():
             self.amcl_pose_received.set()
             self.get_logger().info('AMCL이 초기화되었습니다.')
+            # 청소 작업 시작 (이미 start_cleaning 호출됨)
+            # 필요 시 추가 로직을 여기에 작성할 수 있습니다.
 
     def load_map(self):
         """
         맵 파일을 로드하여 맵 데이터를 설정합니다.
         """
         # 맵 파일 경로 설정 (파라미터로 받아오기)
-        self.declare_parameter('map_test', '/home/theo/4_ws/map_test.yaml')  # 실제 맵 경로로 수정하세요
-        map_file_path = self.get_parameter('map_test').get_parameter_value().string_value
+        self.declare_parameter('map_file_path', '/path/to/your/map.yaml')  # 실제 맵 경로로 수정하세요
+        map_file_path = self.get_parameter('map_file_path').get_parameter_value().string_value
 
         if not os.path.exists(map_file_path):
             self.get_logger().error(f'맵 파일을 찾을 수 없습니다: {map_file_path}')
@@ -220,11 +222,7 @@ class CleaningNode(Node):
         if self.initial_pose_published:
             return
 
-        # AMCL이 초기화될 때까지 대기
-        if not self.amcl_pose_received.is_set():
-            self.get_logger().info('AMCL이 초기화될 때까지 대기 중입니다...')
-            return
-
+        # 초기 위치 퍼블리시
         initial_pose_msg = PoseWithCovarianceStamped()
         initial_pose_msg.header.stamp = self.get_clock().now().to_msg()
         initial_pose_msg.header.frame_id = 'map'
@@ -249,9 +247,8 @@ class CleaningNode(Node):
         # 초기 위치 퍼블리시 타이머 종료
         self.initial_pose_timer.cancel()
 
-        # 청소 작업 시작
-        self.start_cleaning()
-        self.cleaning_started = True  # 청소 시작 플래그 설정
+        # 이제 AMCL이 초기화될 때까지 기다립니다.
+        # AMCL이 초기화되면 amcl_pose_callback에서 청소 작업이 시작됩니다.
 
     def start_cleaning(self):
         """
@@ -318,7 +315,7 @@ class CleaningNode(Node):
             self.get_logger().error('맵 정보가 없습니다. 커버리지 경로를 생성할 수 없습니다.')
             return
 
-        # 로봇의 폭을 고려하여 그리드 크기 설정
+        # 로봇의 반경을 고려하여 그리드 크기 설정
         robot_radius = 0.34  # 로봇의 반경 (미터)
         grid_size = robot_radius * 1.5  # 로봇이 지나갈 수 있는 여유를 두기 위해 설정
 
@@ -577,6 +574,7 @@ class CleaningNode(Node):
             return
 
         self.get_logger().info('"dock" 액션 목표가 수락되었습니다.')
+        self.dock_goal_handle = goal_handle
 
         # 목표 결과를 비동기로 가져옴
         get_result_future = goal_handle.get_result_async()
