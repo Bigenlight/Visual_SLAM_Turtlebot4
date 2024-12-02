@@ -45,7 +45,7 @@ class FrontierExplorer(Node):
         self.goal_timeout = 50.0  # 목표 도달 타임아웃 (초)
 
         self.no_frontier_count = 0  # Number of consecutive times no frontiers were found
-        self.max_no_frontier_retries = 10  # Maximum retries before shutdown
+        self.max_no_frontier_retries = 5  # Maximum retries before shutdown
 
         # 이동 모니터링 변수
         self.last_moving_position = None
