@@ -194,6 +194,9 @@ class CleaningNode(Node):
             img = img.convert('L')  # 흑백으로 변환
             map_array = np.array(img)
 
+            # 맵을 수직으로 뒤집기 (flipud)
+            map_array = np.flipud(map_array)
+
             # 픽셀 값을 OccupancyGrid 값으로 변환
             # 일반적으로 0 (흰색) = free, 100 (검은색) = occupied, -1 = unknown
             map_data = []
