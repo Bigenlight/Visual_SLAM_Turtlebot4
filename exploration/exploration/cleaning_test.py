@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
-from geometry_msgs.msg import PoseStamped, Point, PoseWithCovarianceStamped, Quaternion
+from geometry_msgs.msg import PoseStamped, Point, PoseWithCovarianceStamped, Quaternion, Pose
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from visualization_msgs.msg import Marker, MarkerArray
@@ -17,6 +17,7 @@ from PIL import Image
 import transforms3d
 from action_msgs.msg import GoalStatus
 from irobot_create_msgs.action import WallFollow, Dock
+from threading import Event
 
 class CleaningNode(Node):
     def __init__(self):
@@ -30,6 +31,11 @@ class CleaningNode(Node):
         self.odom_subscriber = self.create_subscription(
             Odometry, '/odom', self.odom_callback, qos_odom)
         self.get_logger().info('Subscribed to /odom topic.')
+
+        # /amcl_pose 토픽 구독 (AMCL 초기화 확인용)
+        self.amcl_pose_subscriber = self.create_subscription(
+            PoseWithCovarianceStamped, '/amcl_pose', self.amcl_pose_callback, 10)
+        self.amcl_pose_received = Event()
 
         # "navigate_to_pose" 액션 클라이언트 초기화
         self.navigate_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -50,10 +56,6 @@ class CleaningNode(Node):
         self.initial_pose_publisher = self.create_publisher(
             PoseWithCovarianceStamped, '/initialpose', 10)
         self.get_logger().info('Initialized /initialpose publisher.')
-
-        # 타이머를 사용하여 초기 위치 퍼블리시 (블로킹 방지)
-        self.initial_pose_timer = self.create_timer(2.0, self.publish_initial_pose)
-        self.get_logger().info('Timer to publish initial pose has been set.')
 
         self.state = 'idle'  # 현재 상태: idle, coverage_cleaning, wall_following, docking
         self.coverage_waypoints = []  # 커버리지 경로 웨이포인트 리스트
@@ -87,6 +89,18 @@ class CleaningNode(Node):
 
         # 초기 위치가 설정되었는지 확인하는 플래그
         self.initial_pose_published = False
+
+        # 초기 위치 퍼블리시를 위한 타이머 설정
+        self.initial_pose_timer = self.create_timer(1.0, self.publish_initial_pose)
+        self.get_logger().info('Timer to publish initial pose has been set.')
+
+    def amcl_pose_callback(self, msg):
+        """
+        AMCL의 위치 추정을 받았을 때 호출되는 콜백 함수입니다.
+        """
+        if not self.amcl_pose_received.is_set():
+            self.amcl_pose_received.set()
+            self.get_logger().info('AMCL이 초기화되었습니다.')
 
     def load_map(self):
         """
@@ -186,19 +200,17 @@ class CleaningNode(Node):
         """
         코드 내에서 직접 초기 위치를 설정합니다.
         """
-        initial_pose = PoseStamped()
-        initial_pose.header.frame_id = 'map'
-        initial_pose.header.stamp = self.get_clock().now().to_msg()
-        initial_pose.pose.position.x = 0.0  # 실제 초기 위치로 수정하세요
-        initial_pose.pose.position.y = 0.0  # 실제 초기 위치로 수정하세요
-        initial_pose.pose.position.z = 0.0
+        initial_pose = Pose()
+        initial_pose.position.x = 0.0  # 실제 초기 위치로 수정하세요
+        initial_pose.position.y = 0.0  # 실제 초기 위치로 수정하세요
+        initial_pose.position.z = 0.0
         # 초기 방향 설정 (여기서는 0도로 설정)
         quat = transforms3d.euler.euler2quat(0, 0, 0, axes='sxyz')
-        initial_pose.pose.orientation.x = quat[1]
-        initial_pose.pose.orientation.y = quat[2]
-        initial_pose.pose.orientation.z = quat[3]
-        initial_pose.pose.orientation.w = quat[0]
-        self.get_logger().info(f'초기 위치 설정: (x={initial_pose.pose.position.x:.2f}, y={initial_pose.pose.position.y:.2f})')
+        initial_pose.orientation.x = quat[1]
+        initial_pose.orientation.y = quat[2]
+        initial_pose.orientation.z = quat[3]
+        initial_pose.orientation.w = quat[0]
+        self.get_logger().info(f'초기 위치 설정: (x={initial_pose.position.x:.2f}, y={initial_pose.position.y:.2f})')
         return initial_pose
 
     def publish_initial_pose(self):
@@ -208,10 +220,15 @@ class CleaningNode(Node):
         if self.initial_pose_published:
             return
 
+        # AMCL이 초기화될 때까지 대기
+        if not self.amcl_pose_received.is_set():
+            self.get_logger().info('AMCL이 초기화될 때까지 대기 중입니다...')
+            return
+
         initial_pose_msg = PoseWithCovarianceStamped()
         initial_pose_msg.header.stamp = self.get_clock().now().to_msg()
         initial_pose_msg.header.frame_id = 'map'
-        initial_pose_msg.pose.pose = self.set_initial_pose().pose
+        initial_pose_msg.pose.pose = self.set_initial_pose()
 
         # Covariance 설정
         initial_pose_msg.pose.covariance = [
@@ -229,12 +246,12 @@ class CleaningNode(Node):
         # 초기 위치가 퍼블리시되었음을 표시
         self.initial_pose_published = True
 
-        # 초기 위치 퍼블리시 후 청소 시작
-        self.start_cleaning()
-        self.cleaning_started = True  # 청소 시작 플래그 설정
-
         # 초기 위치 퍼블리시 타이머 종료
         self.initial_pose_timer.cancel()
+
+        # 청소 작업 시작
+        self.start_cleaning()
+        self.cleaning_started = True  # 청소 시작 플래그 설정
 
     def start_cleaning(self):
         """
@@ -318,11 +335,11 @@ class CleaningNode(Node):
         free_space = np.where(map_array == 0, 1, 0)
 
         # 그리드 기반 경로 생성
-        num_cells_x = int(width * resolution / grid_size)
-        num_cells_y = int(height * resolution / grid_size)
+        num_cells_x = int((width * resolution) / grid_size)
+        num_cells_y = int((height * resolution) / grid_size)
 
-        x_coords = np.linspace(origin_x, origin_x + width * resolution, num_cells_x)
-        y_coords = np.linspace(origin_y, origin_y + height * resolution, num_cells_y)
+        x_coords = np.linspace(origin_x, origin_x + (width - 1) * resolution, num_cells_x)
+        y_coords = np.linspace(origin_y, origin_y + (height - 1) * resolution, num_cells_y)
 
         direction = 1  # 방향 제어 변수
 
