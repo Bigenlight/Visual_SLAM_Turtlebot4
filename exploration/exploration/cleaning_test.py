@@ -137,14 +137,14 @@ class CleaningNode(Node):
         initial_pose_msg.header.frame_id = 'map'
         initial_pose_msg.pose.pose = self.initial_pose.pose
 
-        # Covariance 설정 (필요에 따라 조정 가능)
+        # Covariance 설정 (모든 0을 0.0으로 변경)
         initial_pose_msg.pose.covariance = [
-            0.25, 0, 0, 0, 0, 0,
-            0, 0.25, 0, 0, 0, 0,
-            0, 0, 0.25, 0, 0, 0,
-            0, 0, 0, 0.06853891945200942, 0, 0,
-            0, 0, 0, 0, 0.06853891945200942, 0,
-            0, 0, 0, 0, 0, 0.06853891945200942
+            0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.25, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.06853891945200942, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.06853891945200942, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891945200942
         ]
 
         self.initial_pose_publisher.publish(initial_pose_msg)
