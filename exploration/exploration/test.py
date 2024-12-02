@@ -14,7 +14,6 @@ from collections import deque
 from slam_toolbox.srv import SaveMap  # 맵 저장 서비스 임포트
 from std_msgs.msg import String
 
-
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
@@ -42,8 +41,6 @@ class FrontierExplorer(Node):
         self.safety_distance = 0.02  # 안전 거리 (미터)
         self.max_retries = 10  # 최대 목표 재시도 횟수
         self.retry_count = 0
-        self.goal_timeout = 50.0  # 목표 도달 타임아웃 (초)
-
         self.no_frontier_count = 0  # Number of consecutive times no frontiers were found
         self.max_no_frontier_retries = 5  # Maximum retries before shutdown
 
@@ -51,8 +48,8 @@ class FrontierExplorer(Node):
         self.last_moving_position = None
         self.last_moving_time = None
         self.movement_check_interval = 1.0  # 매 1초마다 확인
-        self.movement_threshold = 0.13  # 10 cm
-        self.movement_timeout = 14.0  # 14초 동안 이동하지 않으면 정지
+        self.movement_threshold = 0.13  # 13 cm
+        self.movement_timeout = 15.0  # 15초 동안 이동하지 않으면 정지
 
         # Publisher to cmd_vel to stop the robot
         self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -80,9 +77,21 @@ class FrontierExplorer(Node):
         # Shutdown flag to prevent multiple shutdowns
         self.shutting_down = False
 
-        # Exploration check timer (calls is_map_explored every 2 seconds)
-        self.exploration_check_timer = self.create_timer(2.0, self.exploration_check_callback)
+        # Exploration check timer (calls is_map_explored every 10 seconds)
+        self.exploration_check_timer = self.create_timer(10.0, self.exploration_check_callback)
 
+        # Add a timer to shut down after 600 seconds (8 minutes)
+        self.shutdown_timer = self.create_timer(600.0, self.shutdown_timer_callback)
+        self.get_logger().info('Shutdown timer started. The node will shut down after 600 seconds.')
+
+    def shutdown_timer_callback(self):
+        """
+        Timer callback to save the map and shut down the node after 600 seconds.
+        """
+        self.get_logger().info('480 seconds have passed. Saving map and shutting down.')
+        self.stop_robot()
+        self.shutdown()
+        
     def map_callback(self, msg):
         """
         /map 토픽의 콜백 함수.
@@ -446,7 +455,7 @@ class FrontierExplorer(Node):
         self.get_logger().info(f'접근 가능한 미지 영역 비율: {accessible_unknown_ratio:.2%}')
 
         # 임계값 설정 (예: 접근 가능한 미지 영역이 수치 미만일 때 탐색 완료로 판단)
-        if accessible_unknown_ratio < 0.002:
+        if accessible_unknown_ratio < 0.0012:
             return True
         else:
             return False
@@ -568,21 +577,21 @@ class FrontierExplorer(Node):
         self.shutting_down = True
         self.get_logger().info('탐사 노드를 종료합니다.')
 
+        try:
+            # 맵 저장 서비스 호출
+            self.save_map()
+        except Exception as e:
+            self.get_logger().error(f'맵 저장 중 예외 발생: {e}')
+
         # Cancel any current goals
         if self.current_goal is not None:
             self.get_logger().info('현재 목표를 취소합니다.')
             cancel_future = self.current_goal.cancel_goal_async()
             rclpy.spin_until_future_complete(self, cancel_future)
             self.current_goal = None
-
+            
         # Stop the robot
         self.stop_robot()
-
-        try:
-            # 맵 저장 서비스 호출
-            self.save_map()
-        except Exception as e:
-            self.get_logger().error(f'맵 저장 중 예외 발생: {e}')
 
         # 청소 알고리즘 시작 신호 발행
         cleaning_msg = Bool()
@@ -597,6 +606,39 @@ class FrontierExplorer(Node):
         self.destroy_node()
         rclpy.shutdown()
 
+    def save_map(self):
+        """
+        현재 맵을 저장하기 위해 /slam_toolbox/save_map 서비스를 호출합니다.
+        """
+        self.get_logger().info('맵 저장 서비스를 호출합니다.')
+
+        # 서비스가 준비될 때까지 대기
+        if not self.save_map_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error('/slam_toolbox/save_map 서비스가 준비되지 않았습니다.')
+            return
+
+        # 서비스 요청 생성
+        request = SaveMap.Request()
+
+        # Properly set the 'name' field as a std_msgs/String message
+        request.name = String()
+        request.name.data = 'map_test'
+
+        # Call the service asynchronously
+        future = self.save_map_client.call_async(request)
+
+        # Wait for the service response
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is not None:
+            if future.result().success:
+                self.get_logger().info('맵이 성공적으로 저장되었습니다.')
+            else:
+                self.get_logger().error(f"맵 저장에 실패하였습니다: {future.result().message}")
+        else:
+            self.get_logger().error('맵 저장 서비스 호출에 실패하였습니다.')
+
+    
     def cancel_all_timers(self):
         """
         모든 활성 타이머를 취소하여 깨끗하게 종료합니다.
@@ -649,6 +691,8 @@ class FrontierExplorer(Node):
             self.get_logger().debug('이동 모니터링을 정지하였습니다.')
 
     def check_movement_callback(self):
+        self.get_logger().debug('check_movement_callback called')
+
         """
         주기적으로 로봇이 충분히 이동했는지 확인합니다.
         이동하지 않았을 경우 다음 프론티어를 탐색합니다.

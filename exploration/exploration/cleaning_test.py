@@ -107,8 +107,8 @@ class CleaningNode(Node):
         맵 파일을 로드하여 맵 데이터를 설정합니다.
         """
         # 맵 파일 경로 설정 (파라미터로 받아오기)
-        self.declare_parameter('map_file_path', '/path/to/your/map.yaml')  # 실제 맵 경로로 수정하세요
-        map_file_path = self.get_parameter('map_file_path').get_parameter_value().string_value
+        self.declare_parameter('map_test', '/home/theo/4_ws/map_test.yaml')  # 실제 맵 경로로 수정하세요
+        map_file_path = self.get_parameter('map_test').get_parameter_value().string_value
 
         if not os.path.exists(map_file_path):
             self.get_logger().error(f'맵 파일을 찾을 수 없습니다: {map_file_path}')
